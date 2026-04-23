@@ -1,0 +1,10 @@
+.direnv/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+sagent-out/
+.envrc.local
+uv.lock
