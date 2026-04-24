@@ -1,10 +1,10 @@
 [project]
 name = "sagent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Scribe agent that observes Claude Code sessions and writes understanding digests"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.40.0",
+    "claude-agent-sdk>=0.1.0",
 ]
 
 [dependency-groups]

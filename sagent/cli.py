@@ -97,10 +97,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
     tl = write_timeline(session, out)
     print(f"  ✓ {tl}")
     if not args.no_llm:
-        backend = args.backend
-        if backend == "auto":
-            backend = "sdk" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
-        print(f"  … running understanding via {backend}")
+        effective = "sdk" if args.backend in ("auto", "sdk") else args.backend
+        print(f"  … running understanding via {effective}")
         try:
             summary, understanding = write_understanding(
                 session, out, model=args.model, backend=args.backend

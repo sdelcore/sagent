@@ -12,13 +12,28 @@
         pkgs = import nixpkgs { inherit system; };
         python = pkgs.python312;
 
+        claude-agent-sdk = python.pkgs.buildPythonPackage rec {
+          pname = "claude-agent-sdk";
+          version = "0.1.66";
+          pyproject = true;
+          src = python.pkgs.fetchPypi {
+            pname = "claude_agent_sdk";
+            inherit version;
+            hash = "sha256-uPsUGYRW9Tb3FzOk2oTsecRNf5Gwb/NKR4YIehsEPEg=";
+          };
+          nativeBuildInputs = with python.pkgs; [ hatchling ];
+          propagatedBuildInputs = with python.pkgs; [ anyio mcp ];
+          pythonImportsCheck = [ "claude_agent_sdk" ];
+          doCheck = false;
+        };
+
         sagent = python.pkgs.buildPythonApplication {
           pname = "sagent";
-          version = "0.2.0";
+          version = "0.3.0";
           src = ./.;
           pyproject = true;
           nativeBuildInputs = with python.pkgs; [ hatchling ];
-          propagatedBuildInputs = with python.pkgs; [ anthropic ];
+          propagatedBuildInputs = [ claude-agent-sdk ];
           doCheck = true;
           nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
           pythonImportsCheck = [

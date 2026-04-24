@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 import shutil
 import subprocess
@@ -70,23 +70,48 @@ def build_transcript(session: Session, max_chars: int = 120_000) -> str:
     return "\n\n".join(blocks)
 
 
-def _run_via_sdk(system: str, user_message: str, model: str, max_tokens: int) -> str:
-    from anthropic import Anthropic
-
-    client = Anthropic()
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=[
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_message}],
+async def _run_via_sdk_async(system: str, user_message: str, model: str) -> str:
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        query,
     )
-    return "".join(b.text for b in resp.content if b.type == "text")
+
+    options = ClaudeAgentOptions(
+        system_prompt=system,
+        model=model,
+        allowed_tools=[],
+        max_turns=1,
+        permission_mode="default",
+    )
+
+    text = ""
+    final_result = ""
+    async for message in query(prompt=user_message, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    text += block.text
+        elif isinstance(message, ResultMessage):
+            if message.result:
+                final_result = message.result
+    return text or final_result
+
+
+def _run_via_sdk(system: str, user_message: str, model: str, max_tokens: int) -> str:
+    """Run a single message via the Claude Agent SDK.
+
+    The Agent SDK authenticates via (in priority order):
+      1. ANTHROPIC_API_KEY env var (direct API)
+      2. CLAUDE_CODE_OAUTH_TOKEN env var (from `claude setup-token`)
+      3. Existing `~/.claude/` login state (same OAuth `claude login` uses)
+
+    So this works on subscription hosts with zero key management — just
+    needs `claude` on PATH (the SDK spawns it internally).
+    """
+    return asyncio.run(_run_via_sdk_async(system, user_message, model))
 
 
 def _run_via_cli(system: str, user_message: str, model: str, timeout: int = 600) -> str:
@@ -135,9 +160,10 @@ def run_understanding(
     """Returns (summary_md, understanding_md).
 
     backend:
-      'auto' — SDK if ANTHROPIC_API_KEY set, else CLI subscription
-      'sdk'  — force SDK (errors if no key)
-      'cli'  — force CLI subscription
+      'auto' — use the Claude Agent SDK (handles subscription OAuth or
+               ANTHROPIC_API_KEY transparently)
+      'sdk'  — same as auto; explicit
+      'cli'  — legacy raw `claude -p` subprocess path
     """
     transcript = build_transcript(session)
     user_message = (
@@ -146,9 +172,7 @@ def run_understanding(
         f"Transcript:\n\n{transcript}"
     )
 
-    chosen = backend
-    if chosen == "auto":
-        chosen = "sdk" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
+    chosen = "sdk" if backend in ("auto", "sdk") else backend
 
     if chosen == "sdk":
         text = _run_via_sdk(UNDERSTANDING_SYSTEM, user_message, model, max_tokens)

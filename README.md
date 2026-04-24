@@ -103,21 +103,25 @@ translate the repo path to the encoded project dir.
 `<project-name>` strips the `-home-<user>-src-` prefix for readability
 (e.g. `-home-sdelcore-src-droidcode` → `droidcode`).
 
-## LLM backends
+## LLM backend
 
-Two paths, both producing the same two markdown files.
+### `sdk` (default) — Claude Agent SDK
 
-### `sdk` (default) — Anthropic Python SDK
+Uses the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python)
+Python package. The Agent SDK authenticates via, in priority order:
 
-Uses the `anthropic` Python package and a direct `messages.create()` call
-with prompt caching on the system prompt. Requires `ANTHROPIC_API_KEY` in
-the environment.
+1. `ANTHROPIC_API_KEY` (direct API call)
+2. `CLAUDE_CODE_OAUTH_TOKEN` (minted by `claude setup-token`)
+3. Existing `~/.claude/` OAuth login (same state `claude login` sets up)
 
-Home-manager users: set `services.sagent.apiKeyFile` to a file containing
-the raw key (no `KEY=` prefix). The module's launcher reads it and exports
-`ANTHROPIC_API_KEY` before starting.
+**On a subscription host with `claude login` already done, no key setup is
+required.** The SDK spawns the `claude` CLI internally and reuses whatever
+auth it has.
 
-Example with opnix:
+To use a direct API key instead (billed per-token rather than subscription),
+set `ANTHROPIC_API_KEY` in the service environment. The home-manager module
+exposes `services.sagent.apiKeyFile` for that — point it at a file whose
+contents are the raw key. Example with opnix:
 
 ```nix
 # nix/modules/secrets/opnix.nix
@@ -130,19 +134,16 @@ secrets."anthropicApiKey" = {
 services.sagent.apiKeyFile = "/var/lib/opnix/secrets/anthropicApiKey";
 ```
 
-### `cli` — Claude Code subscription
+### `cli` — legacy raw subprocess
 
-Shells out to `claude -p --system-prompt … --model …` using the installed
-`claude` CLI. Useful when you don't want to manage an API key and already
-have the subscription. Requires `claude` on PATH and an authenticated
-Claude Code login.
-
-Important flag: sagent passes `--no-session-persistence` so the scribe's
-own calls don't create new JSONL sessions (which would otherwise loop).
+Shells out to `claude -p --system-prompt … --model …` directly. Kept for
+compatibility; the `sdk` backend does the same thing with a cleaner Python
+interface (and is actually a wrapper around the same CLI under the hood).
 
 ### `auto`
 
-Picks `sdk` when `ANTHROPIC_API_KEY` is set, else `cli`.
+Alias for `sdk`. The Agent SDK handles auth fallback internally, so a
+separate `auto` mode isn't really needed — kept for CLI backward compat.
 
 ## Commands in detail
 
@@ -181,7 +182,11 @@ sessions per project with their file sizes.
 | Variable | Purpose |
 |---|---|
 | `SAGENT_OUT` | Override output root |
-| `ANTHROPIC_API_KEY` | Required for SDK backend |
+| `ANTHROPIC_API_KEY` | Use direct-API auth (SDK backend, billed per-token) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Use subscription OAuth token (from `claude setup-token`) |
+
+If none are set, the SDK backend uses the existing `~/.claude/` login state
+that `claude login` created. On subscription hosts, that means no setup.
 
 ## Design decisions
 
