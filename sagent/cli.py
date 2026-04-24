@@ -33,7 +33,6 @@ def default_out_dir() -> Path:
 
 
 def _clean_project_name(dir_name: str) -> str:
-    """Strip the '-home-<user>-src-' prefix from project dir names for readability."""
     home = str(Path.home()).replace("/", "-")
     if dir_name.startswith(home + "-"):
         return dir_name[len(home) + 1 :]
@@ -72,7 +71,6 @@ def _digest_one(
     out_root: Path,
     *,
     model: str,
-    backend: str,
     no_llm: bool,
     verbose: bool = True,
 ) -> None:
@@ -83,8 +81,8 @@ def _digest_one(
     write_timeline(session, out)
     if not no_llm:
         try:
-            write_understanding(session, out, model=model, backend=backend)
-        except RuntimeError as exc:
+            write_understanding(session, out, model=model)
+        except Exception as exc:
             print(f"[sagent] understanding failed for {session_path.name}: {exc}")
 
 
@@ -97,15 +95,11 @@ def cmd_digest(args: argparse.Namespace) -> int:
     tl = write_timeline(session, out)
     print(f"  ✓ {tl}")
     if not args.no_llm:
-        effective = "sdk" if args.backend in ("auto", "sdk") else args.backend
-        print(f"  … running understanding via {effective}")
         try:
-            summary, understanding = write_understanding(
-                session, out, model=args.model, backend=args.backend
-            )
+            summary, understanding = write_understanding(session, out, model=args.model)
             print(f"  ✓ {summary}")
             print(f"  ✓ {understanding}")
-        except RuntimeError as exc:
+        except Exception as exc:
             print(f"  ! understanding failed: {exc}")
             return 1
     return 0
@@ -115,13 +109,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
 
     def on_change(path: Path) -> None:
-        _digest_one(
-            path,
-            out_root,
-            model=args.model,
-            backend=args.backend,
-            no_llm=args.no_llm,
-        )
+        _digest_one(path, out_root, model=args.model, no_llm=args.no_llm)
         print(f"[sagent] digested → {_out_dir_for(path, out_root)}")
 
     if args.target:
@@ -144,13 +132,7 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
     print(f"[sagent] output root: {out_root}")
 
     def on_change(path: Path) -> None:
-        _digest_one(
-            path,
-            out_root,
-            model=args.model,
-            backend=args.backend,
-            no_llm=args.no_llm,
-        )
+        _digest_one(path, out_root, model=args.model, no_llm=args.no_llm)
 
     watch_all(on_change, min_bytes=args.min_bytes)
     return 0
@@ -159,21 +141,14 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
 def cmd_digest_all(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
     print(f"[sagent] output root: {out_root}")
-    min_bytes = args.min_bytes
     count = 0
     for proj in sorted(CLAUDE_PROJECTS.iterdir()):
         if not proj.is_dir():
             continue
         for sess in sorted(proj.glob("*.jsonl")):
-            if sess.stat().st_size < min_bytes:
+            if sess.stat().st_size < args.min_bytes:
                 continue
-            _digest_one(
-                sess,
-                out_root,
-                model=args.model,
-                backend=args.backend,
-                no_llm=args.no_llm,
-            )
+            _digest_one(sess, out_root, model=args.model, no_llm=args.no_llm)
             count += 1
     print(f"[sagent] digested {count} sessions")
     return 0
@@ -201,11 +176,6 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     common_model = dict(default="claude-sonnet-4-6")
-    common_backend = dict(
-        default="auto",
-        choices=["auto", "sdk", "cli"],
-        help="LLM backend: auto=SDK if ANTHROPIC_API_KEY set else CLI subscription",
-    )
     out_help = (
         "output root (default: $SAGENT_OUT or ~/Obsidian/sagent/<hostname>/ "
         "or ./sagent-out)"
@@ -219,14 +189,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     pd.add_argument("--out", default=None, help=out_help)
     pd.add_argument("--model", **common_model)
-    pd.add_argument("--backend", **common_backend)
     pd.add_argument("--no-llm", action="store_true", help="skip LLM understanding")
     pd.set_defaults(func=cmd_digest)
 
     pda = sub.add_parser("digest-all", help="digest every session across all projects")
     pda.add_argument("--out", default=None, help=out_help)
     pda.add_argument("--model", **common_model)
-    pda.add_argument("--backend", **common_backend)
     pda.add_argument("--no-llm", action="store_true")
     pda.add_argument(
         "--min-bytes",
@@ -240,7 +208,6 @@ def main(argv: list[str] | None = None) -> int:
     pw.add_argument("target", nargs="?")
     pw.add_argument("--out", default=None, help=out_help)
     pw.add_argument("--model", **common_model)
-    pw.add_argument("--backend", **common_backend)
     pw.add_argument("--no-llm", action="store_true")
     pw.set_defaults(func=cmd_watch)
 
@@ -249,7 +216,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     pwa.add_argument("--out", default=None, help=out_help)
     pwa.add_argument("--model", **common_model)
-    pwa.add_argument("--backend", **common_backend)
     pwa.add_argument("--no-llm", action="store_true")
     pwa.add_argument(
         "--min-bytes",

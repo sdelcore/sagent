@@ -640,9 +640,10 @@ repo) for the deployment module.
   inventory, files touched. Zero LLM cost.
 - LLM-based `summary.md` + `understanding.md` (`sagent/understand.py`):
   running prose digest plus decisions, open threads, ideas, user
-  preferences, and risks. Defaults to `claude-sonnet-4-6` via the
-  Anthropic Python SDK with prompt caching; falls back to `claude -p`
-  subscription when `ANTHROPIC_API_KEY` is absent.
+  preferences, and risks. Defaults to `claude-sonnet-4-6` via the Claude
+  Agent SDK, which transparently handles API-key, OAuth-token, and
+  `~/.claude/` login-state auth — so subscription hosts need zero key
+  setup.
 - File-polling watcher with quiet-period debounce (`sagent/watcher.py`).
   `watch-all` follows every project in `~/.claude/projects/` at once.
 - CLI (`sagent/cli.py`): `digest`, `digest-all`, `watch`, `watch-all`,

@@ -80,7 +80,6 @@ common flags:
   --out PATH           output root (default: $SAGENT_OUT or
                        ~/Obsidian/sagent/<hostname>/ or ./sagent-out)
   --model MODEL        model id (default: claude-sonnet-4-6)
-  --backend BACKEND    auto | sdk | cli (default: auto)
   --no-llm             rule-based timeline only, no LLM cost
 ```
 
@@ -103,24 +102,21 @@ translate the repo path to the encoded project dir.
 `<project-name>` strips the `-home-<user>-src-` prefix for readability
 (e.g. `-home-sdelcore-src-droidcode` → `droidcode`).
 
-## LLM backend
+## Auth
 
-### `sdk` (default) — Claude Agent SDK
+sagent uses the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
+It authenticates via (in priority order):
 
-Uses the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python)
-Python package. The Agent SDK authenticates via, in priority order:
+1. `ANTHROPIC_API_KEY` — direct-API, billed per token
+2. `CLAUDE_CODE_OAUTH_TOKEN` — minted by `claude setup-token`
+3. Existing `~/.claude/` OAuth login — whatever `claude login` set up
 
-1. `ANTHROPIC_API_KEY` (direct API call)
-2. `CLAUDE_CODE_OAUTH_TOKEN` (minted by `claude setup-token`)
-3. Existing `~/.claude/` OAuth login (same state `claude login` sets up)
+**On a subscription host that already has `claude login`, no key setup is
+required.** The SDK reuses the subscription auth and usage counts against
+the Claude Code subscription quota.
 
-**On a subscription host with `claude login` already done, no key setup is
-required.** The SDK spawns the `claude` CLI internally and reuses whatever
-auth it has.
-
-To use a direct API key instead (billed per-token rather than subscription),
-set `ANTHROPIC_API_KEY` in the service environment. The home-manager module
-exposes `services.sagent.apiKeyFile` for that — point it at a file whose
+To force the direct-API path, set `ANTHROPIC_API_KEY`. With the
+home-manager module, set `services.sagent.apiKeyFile` to a file whose
 contents are the raw key. Example with opnix:
 
 ```nix
@@ -133,17 +129,6 @@ secrets."anthropicApiKey" = {
 # home/<hostname>.nix
 services.sagent.apiKeyFile = "/var/lib/opnix/secrets/anthropicApiKey";
 ```
-
-### `cli` — legacy raw subprocess
-
-Shells out to `claude -p --system-prompt … --model …` directly. Kept for
-compatibility; the `sdk` backend does the same thing with a cleaner Python
-interface (and is actually a wrapper around the same CLI under the hood).
-
-### `auto`
-
-Alias for `sdk`. The Agent SDK handles auth fallback internally, so a
-separate `auto` mode isn't really needed — kept for CLI backward compat.
 
 ## Commands in detail
 
@@ -185,8 +170,8 @@ sessions per project with their file sizes.
 | `ANTHROPIC_API_KEY` | Use direct-API auth (SDK backend, billed per-token) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Use subscription OAuth token (from `claude setup-token`) |
 
-If none are set, the SDK backend uses the existing `~/.claude/` login state
-that `claude login` created. On subscription hosts, that means no setup.
+If none are set, the SDK uses the existing `~/.claude/` login state that
+`claude login` created. On subscription hosts, that means no setup.
 
 ## Design decisions
 

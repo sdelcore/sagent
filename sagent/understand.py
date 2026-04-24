@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
 from .parser import Event, Session
@@ -100,70 +97,14 @@ async def _run_via_sdk_async(system: str, user_message: str, model: str) -> str:
     return text or final_result
 
 
-def _run_via_sdk(system: str, user_message: str, model: str, max_tokens: int) -> str:
-    """Run a single message via the Claude Agent SDK.
-
-    The Agent SDK authenticates via (in priority order):
-      1. ANTHROPIC_API_KEY env var (direct API)
-      2. CLAUDE_CODE_OAUTH_TOKEN env var (from `claude setup-token`)
-      3. Existing `~/.claude/` login state (same OAuth `claude login` uses)
-
-    So this works on subscription hosts with zero key management — just
-    needs `claude` on PATH (the SDK spawns it internally).
-    """
-    return asyncio.run(_run_via_sdk_async(system, user_message, model))
-
-
-def _run_via_cli(system: str, user_message: str, model: str, timeout: int = 600) -> str:
-    """Fall back to the `claude` CLI using the user's subscription auth.
-
-    --no-session-persistence prevents the scribe's own call from landing in
-    ~/.claude/projects — otherwise scribe watching its own project would pick
-    up its own invocations and loop.
-    """
-    if not shutil.which("claude"):
-        raise RuntimeError(
-            "neither ANTHROPIC_API_KEY nor `claude` CLI is available"
-        )
-    cmd = [
-        "claude",
-        "-p",
-        "--system-prompt", system,
-        "--model", model,
-        "--output-format", "text",
-        "--no-session-persistence",
-        "--disable-slash-commands",
-        "--tools", "",
-        "--permission-mode", "default",
-    ]
-    result = subprocess.run(
-        cmd,
-        input=user_message,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI failed (exit {result.returncode}): "
-            f"{result.stderr.strip() or result.stdout.strip()[:500]}"
-        )
-    return result.stdout
-
-
 def run_understanding(
     session: Session,
     model: str = "claude-sonnet-4-6",
-    max_tokens: int = 4096,
-    backend: str = "auto",
 ) -> tuple[str, str]:
     """Returns (summary_md, understanding_md).
 
-    backend:
-      'auto' — use the Claude Agent SDK (handles subscription OAuth or
-               ANTHROPIC_API_KEY transparently)
-      'sdk'  — same as auto; explicit
-      'cli'  — legacy raw `claude -p` subprocess path
+    The Agent SDK authenticates via (in priority order): ANTHROPIC_API_KEY,
+    CLAUDE_CODE_OAUTH_TOKEN, or the existing `~/.claude/` OAuth login.
     """
     transcript = build_transcript(session)
     user_message = (
@@ -172,14 +113,7 @@ def run_understanding(
         f"Transcript:\n\n{transcript}"
     )
 
-    chosen = "sdk" if backend in ("auto", "sdk") else backend
-
-    if chosen == "sdk":
-        text = _run_via_sdk(UNDERSTANDING_SYSTEM, user_message, model, max_tokens)
-    elif chosen == "cli":
-        text = _run_via_cli(UNDERSTANDING_SYSTEM, user_message, model)
-    else:
-        raise ValueError(f"unknown backend: {backend}")
+    text = asyncio.run(_run_via_sdk_async(UNDERSTANDING_SYSTEM, user_message, model))
 
     sep = "---UNDERSTANDING---"
     if sep in text:
@@ -193,10 +127,9 @@ def write_understanding(
     session: Session,
     out_dir: Path,
     model: str = "claude-sonnet-4-6",
-    backend: str = "auto",
 ) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary, understanding = run_understanding(session, model=model, backend=backend)
+    summary, understanding = run_understanding(session, model=model)
     summary_path = out_dir / "summary.md"
     understanding_path = out_dir / "understanding.md"
     summary_path.write_text(summary)
