@@ -154,7 +154,7 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
             no_llm=args.no_llm,
         )
 
-    watch_all(on_change)
+    watch_all(on_change, min_bytes=args.min_bytes)
     return 0
 
 
@@ -253,6 +253,12 @@ def main(argv: list[str] | None = None) -> int:
     pwa.add_argument("--model", **common_model)
     pwa.add_argument("--backend", **common_backend)
     pwa.add_argument("--no-llm", action="store_true")
+    pwa.add_argument(
+        "--min-bytes",
+        type=int,
+        default=5000,
+        help="skip sessions smaller than this many bytes (default: 5000)",
+    )
     pwa.set_defaults(func=cmd_watch_all)
 
     pl = sub.add_parser("list", help="list Claude Code projects with sessions")

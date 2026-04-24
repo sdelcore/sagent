@@ -107,13 +107,17 @@ def watch_all(
     root: Path = CLAUDE_PROJECTS,
     interval: float = 2.0,
     quiet_seconds: float = 3.0,
+    min_bytes: int = 5_000,
 ) -> None:
     """Watch every project under root, digesting each session when it settles.
 
     Tracks per-file sizes; fires on_change once per file after writes settle.
     Picks up new project directories and new sessions as they appear.
+    Skips sessions below `min_bytes` — Claude Code writes stub JSONLs
+    (permission-mode, file-history-snapshot records only) on every
+    invocation and those are noise.
     """
-    print(f"[sagent] watch-all: {root}")
+    print(f"[sagent] watch-all: {root} (skip < {min_bytes} bytes)")
     last_size: dict[Path, int] = {}
     last_change_at: dict[Path, float] = {}
     fired_for_size: dict[Path, int] = {}
@@ -130,13 +134,14 @@ def watch_all(
                     size = sess.stat().st_size
                 except FileNotFoundError:
                     continue
+                if size < min_bytes:
+                    continue
                 prev = last_size.get(sess, -1)
                 if size != prev:
                     last_size[sess] = size
                     last_change_at[sess] = now
                 elif (
-                    size > 0
-                    and fired_for_size.get(sess, -1) != size
+                    fired_for_size.get(sess, -1) != size
                     and now - last_change_at.get(sess, now) >= quiet_seconds
                 ):
                     try:
