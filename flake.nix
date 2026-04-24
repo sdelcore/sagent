@@ -14,19 +14,19 @@
 
         sagent = python.pkgs.buildPythonApplication {
           pname = "sagent";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           pyproject = true;
           nativeBuildInputs = with python.pkgs; [ hatchling ];
-          # No runtime python deps — the LLM backend shells out to `claude`.
-          # Users who want the SDK path can install the `sdk` extra.
-          propagatedBuildInputs = [ ];
-          # The `claude` CLI is not declared as a dep so sagent works with
-          # --no-llm or user-provided PATH. Downstream nix modules that want
-          # the subscription backend should add claude-code to the user PATH.
+          propagatedBuildInputs = with python.pkgs; [ anthropic ];
           doCheck = true;
           nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
-          pythonImportsCheck = [ "sagent" "sagent.cli" "sagent.parser" ];
+          pythonImportsCheck = [
+            "sagent"
+            "sagent.cli"
+            "sagent.parser"
+            "sagent.understand"
+          ];
         };
       in {
         packages.default = sagent;

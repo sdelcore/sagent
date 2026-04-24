@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sagent", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    common_model = dict(default="claude-haiku-4-5-20251001")
+    common_model = dict(default="claude-sonnet-4-6")
     common_backend = dict(
         default="auto",
         choices=["auto", "sdk", "cli"],

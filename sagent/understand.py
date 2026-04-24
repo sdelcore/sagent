@@ -128,7 +128,7 @@ def _run_via_cli(system: str, user_message: str, model: str, timeout: int = 600)
 
 def run_understanding(
     session: Session,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-6",
     max_tokens: int = 4096,
     backend: str = "auto",
 ) -> tuple[str, str]:
@@ -168,7 +168,7 @@ def run_understanding(
 def write_understanding(
     session: Session,
     out_dir: Path,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-sonnet-4-6",
     backend: str = "auto",
 ) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)

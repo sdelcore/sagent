@@ -626,31 +626,62 @@ honest answer is probably: don't. Write better CLAUDE.md files, use
 
 ---
 
-## 9. Concrete first step for `sagent`
+## 9. What `sagent` actually is, as built
 
-Given this repo already has the auto-memory system wired through
-`CLAUDE.md`, the natural MVP is:
+The MVP landed as a **read-only session observer**, not an injector. See
+`README.md` for usage and `nix/home-manager/sagent.nix` (via the infra
+repo) for the deployment module.
 
-1. **Stage 1 — passive cataloging.** A `SessionEnd` hook runs a small
-   model over the JSONL and appends to three files under this repo:
-   `scribe/ideas.md`, `scribe/decisions.md`, `scribe/open_threads.md`.
-   No injection yet. Verify the digests are useful by reading them.
-2. **Stage 2 — memory curation.** Let the scribe (not the primary) own
-   writes to the `memory/` directory. Remove the self-curation block
-   from `CLAUDE.md`, replacing it with "your memory is managed for you."
-3. **Stage 3 — per-turn injection.** Add a `UserPromptSubmit` hook that
-   reads the top-N catalog entries relevant to the user's prompt (simple
-   BM25 over the catalog files is enough to start) and emits them as
-   `additionalContext`.
-4. **Stage 4 — pre-compaction augmentation.** Hook `PreCompact` (Claude
-   Code) / `experimental.session.compacting` (opencode) to inject the
-   running digest into the harness's compaction prompt.
-5. **Stage 5 — harness-agnostic core.** Extract the scribe's digest/
-   extract/recall pipeline into a stand-alone CLI so the same engine
-   powers Claude Code hooks, opencode plugins, and an API proxy mode.
+**Shipped (v0.2.0):**
 
-Stage 1 is a weekend; stages 2–4 are each a sitting; stage 5 is real
-work. Worth doing in order so each stage is independently useful.
+- JSONL parser (`sagent/parser.py`) normalizing Claude Code session
+  records into an Event stream.
+- Rule-based `timeline.md` (`sagent/digest.py`): chronology, tool
+  inventory, files touched. Zero LLM cost.
+- LLM-based `summary.md` + `understanding.md` (`sagent/understand.py`):
+  running prose digest plus decisions, open threads, ideas, user
+  preferences, and risks. Defaults to `claude-sonnet-4-6` via the
+  Anthropic Python SDK with prompt caching; falls back to `claude -p`
+  subscription when `ANTHROPIC_API_KEY` is absent.
+- File-polling watcher with quiet-period debounce (`sagent/watcher.py`).
+  `watch-all` follows every project in `~/.claude/projects/` at once.
+- CLI (`sagent/cli.py`): `digest`, `digest-all`, `watch`, `watch-all`,
+  `list`.
+- Default output: `~/Obsidian/sagent/<hostname>/<project>/<session>/*.md`,
+  overridable via `$SAGENT_OUT` or `--out`.
+- Nix flake with `packages.default`, `apps.default`, `devShells.default`.
+- Home-manager module with `services.sagent.enable`, systemd user
+  service, optional `apiKeyFile` for opnix-style raw key secrets.
+- 27 tests covering parser, digest, watcher, and CLI helpers.
+
+**Not built, deliberately.** The "shadow writer" framing in §3.3 talks
+about a spectrum from passive cataloging up to transcript rewriting and
+API-proxy context replacement. sagent stops at passive cataloging
+(level 1). None of these are implemented:
+
+- Injection into the primary agent's context (§3.3 levels 3–6).
+- Memory-file curation — no writes under `~/.claude/`.
+- Pre-compaction augmentation hooks.
+- Cross-session consolidation.
+- Opencode / Cursor / Codex integration.
+
+The case against building further (§7) still applies to each subsequent
+stage. Revisit only if the level-1 digests turn out to be materially
+useful in practice — and only then, advance one level at a time.
+
+**Future stages, if they're ever justified:**
+
+1. *Memory curation.* Let sagent own writes to `~/.claude/memory/`.
+   Remove the primary agent's self-curation block from `CLAUDE.md`.
+2. *Per-turn injection.* Add a `UserPromptSubmit` hook that reads the
+   top-N catalog entries relevant to the user's prompt and emits them
+   as `additionalContext`.
+3. *Pre-compaction augmentation.* Hook `PreCompact` (Claude Code) or
+   `experimental.session.compacting` (opencode) to inject the running
+   digest into the harness's compaction prompt.
+4. *Harness-agnostic core.* Extract the digest/extract/recall pipeline
+   into a library so the same engine drives Claude Code hooks, opencode
+   plugins, and an API-proxy mode.
 
 ---
 
