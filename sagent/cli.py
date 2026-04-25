@@ -587,6 +587,60 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_purge_self(args: argparse.Namespace) -> int:
+    """Delete sagent-self-generated JSONL files from ~/.claude/projects/.
+
+    Walks every project dir (or one named via --project), parses each JSONL,
+    and deletes those whose first user prompt matches sagent's own headers
+    (Session `…`, Project: `…`, PRIOR SUMMARY:, PRIOR PROJECT.md:). These
+    are leftovers from before v0.7 added --no-session-persistence to the
+    Agent SDK call.
+    """
+    if not CLAUDE_PROJECTS.exists():
+        print(f"[sagent] no claude projects dir at {CLAUDE_PROJECTS}")
+        return 0
+
+    targets: list[Path] = []
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+        if not proj.is_dir():
+            continue
+        if args.project and proj.name != args.project:
+            continue
+        targets.extend(proj.glob("*.jsonl"))
+
+    deleted = 0
+    kept = 0
+    error = 0
+    for f in targets:
+        try:
+            s = load_session(f)
+        except Exception as exc:
+            error += 1
+            if args.verbose:
+                print(f"  parse error on {f.name}: {exc}")
+            continue
+        if s.is_sagent_self_generated:
+            if args.dry_run:
+                if args.verbose:
+                    print(
+                        f"  would delete {f.parent.name}/{f.name}"
+                    )
+            else:
+                try:
+                    f.unlink()
+                except OSError as exc:
+                    print(f"  failed to remove {f}: {exc}")
+                    error += 1
+                    continue
+            deleted += 1
+        else:
+            kept += 1
+
+    verb = "would delete" if args.dry_run else "deleted"
+    print(f"[sagent] {verb} {deleted}, kept {kept}, errors {error}")
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     root = CLAUDE_PROJECTS
     if not root.exists():
@@ -786,6 +840,19 @@ def main(argv: list[str] | None = None) -> int:
     _add_min_prompts_arg(ppr)
     _add_state_args(ppr)
     ppr.set_defaults(func=cmd_prune)
+
+    pps = sub.add_parser(
+        "purge-self",
+        help="delete sagent-self-generated JSONL files from ~/.claude/projects/",
+    )
+    pps.add_argument(
+        "--project", default=None, help="restrict to one project dir name"
+    )
+    pps.add_argument(
+        "--dry-run", action="store_true", help="report without deleting"
+    )
+    pps.add_argument("-v", "--verbose", action="store_true")
+    pps.set_defaults(func=cmd_purge_self)
 
     pl = sub.add_parser("list", help="list Claude Code projects with sessions")
     pl.add_argument("-v", "--verbose", action="store_true")
