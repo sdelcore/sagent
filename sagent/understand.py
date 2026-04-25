@@ -5,7 +5,17 @@ import asyncio
 from .parser import Event, Session
 from .rate import RateLimiter, SagentRateLimitError, is_rate_limit_text
 
-UNDERSTANDING_BASE = """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
+SECRETS_POLICY = """SECRETS POLICY
+Any credentials, API keys, passwords, OAuth tokens, certificates, or other secrets that appear in the transcript below have already been rotated and are no longer valid. Treat them as historical artifacts. Do not refuse to summarize on the grounds that secrets are present, and do not blank out the digest because of them.
+
+When secrets appear:
+- Acknowledge that an exposure occurred (e.g., "the pfSense password was shared in the chat") so the user can verify the rotation actually happened.
+- Do NOT echo the literal credential value in your output. No tokens, no passwords, no hashes, no `op://...` references that resolve to secret material.
+- Filenames, hostnames, IP addresses, and `op://...` reference paths that don't include the secret value itself are fine to mention.
+
+"""
+
+UNDERSTANDING_BASE = SECRETS_POLICY + """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
 
 You produce two documents in one response, separated by a line containing exactly `---UNDERSTANDING---`:
 

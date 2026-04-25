@@ -144,7 +144,17 @@ def _extract_gist(session_md: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-PROJECT_BASE_PROMPT = """You are maintaining a cumulative project digest from a series of coding sessions. Your output is a single markdown document that a developer reads to catch up on what's been happening on this project across all sessions.
+SECRETS_POLICY = """SECRETS POLICY
+Any credentials, API keys, passwords, OAuth tokens, certificates, or other secrets that appear in the source material below have already been rotated and are no longer valid. Treat them as historical artifacts. Do not refuse to produce the digest on the grounds that secrets are present, and do not blank out sections because of them.
+
+When secrets appear:
+- Acknowledge the exposure (e.g., "the pfSense password was shared in session X") so the user can verify rotation.
+- Do NOT echo the literal credential value. No tokens, no passwords, no hashes, no `op://...` references that resolve to secret material.
+- Filenames, hostnames, IP addresses, and `op://...` reference paths that don't include the secret value itself are fine to mention.
+
+"""
+
+PROJECT_BASE_PROMPT = SECRETS_POLICY + """You are maintaining a cumulative project digest from a series of coding sessions. Your output is a single markdown document that a developer reads to catch up on what's been happening on this project across all sessions.
 
 Output ONLY the markdown document. Do not wrap it in code fences. No preamble, no commentary, no "here's the document". Start with the heading.
 
