@@ -125,6 +125,70 @@ def test_load_session(tmp_path: Path):
     assert sess.tool_uses[0].tool_name == "Bash"
 
 
+def test_is_sagent_self_generated_per_session_prompt():
+    from sagent.parser import Event, Session
+
+    s = Session(
+        session_id="x",
+        path=Path("x"),
+        events=[
+            Event(
+                kind="user_prompt",
+                uuid="",
+                parent_uuid=None,
+                timestamp=None,
+                text="Session `abc` (cwd: `/x`)\n\nTranscript:\n\n[0] USER:\nhi",
+            )
+        ],
+    )
+    assert s.is_sagent_self_generated
+
+
+def test_is_sagent_self_generated_project_prompt():
+    from sagent.parser import Event, Session
+
+    s = Session(
+        session_id="x",
+        path=Path("x"),
+        events=[
+            Event(
+                kind="user_prompt",
+                uuid="",
+                parent_uuid=None,
+                timestamp=None,
+                text="Project: `src-foo`\n\nThis is the first roll-up...",
+            )
+        ],
+    )
+    assert s.is_sagent_self_generated
+
+
+def test_is_sagent_self_generated_negative():
+    from sagent.parser import Event, Session
+
+    s = Session(
+        session_id="x",
+        path=Path("x"),
+        events=[
+            Event(
+                kind="user_prompt",
+                uuid="",
+                parent_uuid=None,
+                timestamp=None,
+                text="how do I configure systemd timer",
+            )
+        ],
+    )
+    assert not s.is_sagent_self_generated
+
+
+def test_is_sagent_self_generated_empty():
+    from sagent.parser import Session
+
+    s = Session(session_id="x", path=Path("x"), events=[])
+    assert not s.is_sagent_self_generated
+
+
 def test_load_session_tolerates_bad_json(tmp_path: Path):
     p = tmp_path / "s.jsonl"
     p.write_text(

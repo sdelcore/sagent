@@ -65,6 +65,26 @@ class Session:
     def short_id(self) -> str:
         return self.session_id.split("-")[0][:8]
 
+    @property
+    def is_sagent_self_generated(self) -> bool:
+        """True if the first user prompt looks like one sagent emits.
+
+        Used to skip sessions that were created by sagent's own LLM calls
+        when the Agent SDK was persisting them — leftovers from before the
+        --no-session-persistence flag landed.
+        """
+        prompts = self.user_prompts
+        if not prompts:
+            return False
+        head = prompts[0].text.lstrip()
+        markers = (
+            "Session `",  # per-session digest prompt header
+            "Project: `",  # project rollup prompt header
+            "PRIOR SUMMARY:",  # incremental update marker
+            "PRIOR PROJECT.md:",  # incremental rollup marker
+        )
+        return any(head.startswith(m) for m in markers)
+
 
 def _content_blocks(msg: dict) -> list[dict]:
     c = msg.get("content")

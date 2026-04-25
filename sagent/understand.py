@@ -110,6 +110,13 @@ async def _query_async(
         allowed_tools=[],
         max_turns=1,
         permission_mode="default",
+        # Critical: prevent the SDK from writing our prompt as a new
+        # ~/.claude/projects/<...>.jsonl session that the watcher would
+        # then pick up and digest, recursing.
+        extra_args={
+            "no-session-persistence": None,
+            "disable-slash-commands": None,
+        },
     )
 
     text = ""

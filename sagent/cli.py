@@ -114,6 +114,24 @@ def _digest_one(
     session = load_session(session_path)
     project_dir = _project_dir_for(session_path, out_root)
 
+    # Drop sagent's own LLM-call sessions (created when the Agent SDK
+    # persisted them to ~/.claude/projects). Without this, the watcher
+    # finds them and digests its own prompts, recursing.
+    if session.is_sagent_self_generated:
+        if verbose:
+            print(
+                f"[sagent] {session_path.name} is sagent-self-generated, skipping"
+            )
+        existing = _existing_session_md(project_dir, session.session_id)
+        if existing and existing.exists():
+            existing.unlink()
+        if state is not None:
+            state.mark_digested(
+                session_path, size=current_size, event_index=len(session.events)
+            )
+            state.save()
+        return
+
     # Drop empty/trivial sessions
     if len(session.user_prompts) < min_prompts:
         if verbose:
