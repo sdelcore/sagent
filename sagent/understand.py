@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from .parser import Event, Session
 from .rate import RateLimiter, SagentRateLimitError, is_rate_limit_text
+
+# Strip Claude Code's auto-injected wrappers from user prompts before sending
+# to the digest LLM. These add no signal and bloat token counts.
+_NOISE_TAG_RE = re.compile(
+    r"<(local-command-caveat|system-reminder|bash-stdout|bash-stderr|"
+    r"command-stdout|command-stderr|stdout|stderr)>.*?</\1>",
+    re.DOTALL,
+)
+_OPEN_NOISE_TAG_RE = re.compile(
+    r"<(local-command-caveat|system-reminder|bash-stdout|bash-stderr|"
+    r"command-stdout|command-stderr|stdout|stderr)\b[^>]*/>",
+)
 
 SECRETS_POLICY = """SECRETS POLICY
 Any credentials, API keys, passwords, OAuth tokens, certificates, or other secrets that appear in the transcript below have already been rotated and are no longer valid. Treat them as historical artifacts. Do not refuse to summarize on the grounds that secrets are present, and do not blank out the digest because of them.
@@ -62,22 +75,67 @@ Produce an updated full digest (Summary + Understanding) that:
 Output the FULL updated documents in the same format as a fresh digest. Do not output a diff. Do not say "no changes" — always produce both documents."""
 
 
-def _render_event(e: Event, idx: int) -> str:
+def _strip_noise_tags(text: str) -> str:
+    text = _NOISE_TAG_RE.sub("", text)
+    text = _OPEN_NOISE_TAG_RE.sub("", text)
+    return text.strip()
+
+
+def _brief_tool(e: Event) -> str:
+    """Compact tool signature: name + minimal target. No full inputs."""
+    name = e.tool_name or "?"
+    inp = e.tool_input or {}
+    if name in ("Edit", "Write", "Read", "NotebookEdit"):
+        target = inp.get("file_path") or inp.get("notebook_path") or ""
+        return f"{name} {target}" if target else name
+    if name == "Bash":
+        cmd = (inp.get("command") or "").strip()
+        return f"Bash: {cmd[:80]}"
+    if name == "Grep":
+        pat = inp.get("pattern", "")
+        return f"Grep {pat!r}"
+    if name == "Glob":
+        return f"Glob {inp.get('pattern', '')}"
+    if name in ("WebSearch", "WebFetch"):
+        q = inp.get("query") or inp.get("url") or ""
+        return f"{name} {q[:80]}"
+    if name == "TaskCreate":
+        return f"TaskCreate: {(inp.get('subject') or '')[:80]}"
+    if name == "TaskUpdate":
+        return f"TaskUpdate"
+    if name == "Agent":
+        sub = inp.get("subagent_type", "general")
+        desc = inp.get("description", "")
+        return f"Agent[{sub}]: {desc[:60]}" if desc else f"Agent[{sub}]"
+    return name
+
+
+def _render_event(e: Event, idx: int) -> str | None:
+    """Render an event for the LLM digest, or None to drop it.
+
+    Dropped: assistant_thinking (internal reasoning, noise for summary),
+    successful tool_result (file contents, command stdout, etc.),
+    system events. Tool inputs are reduced to a brief signature so the
+    LLM sees what was done without the full payload.
+    """
     ts = (e.timestamp or "").split("T")[-1].rstrip("Z").split(".")[0]
     if e.kind == "user_prompt":
-        return f"[{idx} {ts}] USER:\n{e.text}"
+        text = _strip_noise_tags(e.text)
+        if not text:
+            return None
+        return f"[{idx} {ts}] USER:\n{text}"
     if e.kind == "assistant_text":
-        return f"[{idx} {ts}] CLAUDE:\n{e.text}"
-    if e.kind == "assistant_thinking":
-        snippet = e.text[:600]
-        return f"[{idx} {ts}] (thinking): {snippet}"
+        text = e.text.strip()
+        if not text:
+            return None
+        return f"[{idx} {ts}] CLAUDE:\n{text}"
     if e.kind == "tool_use":
-        inp_preview = str(e.tool_input)[:400] if e.tool_input else ""
-        return f"[{idx} {ts}] TOOL {e.tool_name}: {inp_preview}"
-    if e.kind == "tool_result":
-        tag = "TOOL_ERROR" if e.is_error else "TOOL_RESULT"
-        return f"[{idx} {ts}] {tag}: {e.text[:400]}"
-    return f"[{idx} {ts}] {e.kind}: {e.text[:200]}"
+        return f"[{idx} {ts}] (tool: {_brief_tool(e)})"
+    if e.kind == "tool_result" and e.is_error:
+        return f"[{idx} {ts}] (tool error: {e.text[:200]})"
+    # Drop everything else: assistant_thinking, successful tool_result,
+    # system, attachments, etc.
+    return None
 
 
 def build_transcript(
@@ -87,13 +145,19 @@ def build_transcript(
 ) -> str:
     blocks: list[str] = []
     total = 0
+    skipped = 0
     for offset, e in enumerate(events):
         block = _render_event(e, start_index + offset)
-        total += len(block)
-        if total > max_chars:
-            blocks.append(f"... [{len(events) - offset} further events truncated]")
+        if block is None:
+            skipped += 1
+            continue
+        if total + len(block) > max_chars:
+            blocks.append(
+                f"... [{len(events) - offset} further events truncated]"
+            )
             break
         blocks.append(block)
+        total += len(block)
     return "\n\n".join(blocks)
 
 
