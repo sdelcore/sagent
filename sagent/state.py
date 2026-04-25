@@ -28,8 +28,15 @@ class SessionRecord:
     digest_count: int = 0
 
 
+@dataclass
+class ProjectRecord:
+    last_rolled_up_session_id: str = ""
+    last_rolled_up_at: str = ""
+    rollup_count: int = 0
+
+
 class StateStore:
-    """Persistent per-session digest state.
+    """Persistent per-session and per-project digest state.
 
     Single JSON file, atomic writes via temp-then-rename. One writer (the
     sagent process); no locking. Tolerant to a missing or corrupt file —
@@ -39,6 +46,7 @@ class StateStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path else default_state_path()
         self.sessions: dict[str, SessionRecord] = {}
+        self.projects: dict[str, ProjectRecord] = {}
         self._loaded_version = CURRENT_VERSION
         self.load()
 
@@ -62,12 +70,24 @@ class StateStore:
                 digest_count=int(v.get("digest_count", 0)),
             )
         self.sessions = loaded
+        raw_p = data.get("projects") or {}
+        loaded_p: dict[str, ProjectRecord] = {}
+        for k, v in raw_p.items():
+            if not isinstance(v, dict):
+                continue
+            loaded_p[k] = ProjectRecord(
+                last_rolled_up_session_id=str(v.get("last_rolled_up_session_id", "")),
+                last_rolled_up_at=str(v.get("last_rolled_up_at", "")),
+                rollup_count=int(v.get("rollup_count", 0)),
+            )
+        self.projects = loaded_p
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": CURRENT_VERSION,
             "sessions": {k: asdict(v) for k, v in self.sessions.items()},
+            "projects": {k: asdict(v) for k, v in self.projects.items()},
         }
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -127,3 +147,13 @@ class StateStore:
         for k in gone:
             del self.sessions[k]
         return len(gone)
+
+    def get_project(self, project_name: str) -> ProjectRecord | None:
+        return self.projects.get(project_name)
+
+    def mark_rolled_up(self, project_name: str, *, session_id: str) -> ProjectRecord:
+        rec = self.projects.setdefault(project_name, ProjectRecord())
+        rec.last_rolled_up_session_id = session_id
+        rec.last_rolled_up_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec.rollup_count += 1
+        return rec

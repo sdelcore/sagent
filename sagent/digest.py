@@ -101,8 +101,71 @@ def build_timeline(session: Session) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_timeline(session: Session, out_dir: Path) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "timeline.md"
-    out.write_text(build_timeline(session))
-    return out
+def _strip_top_heading(md: str, heading_starts: tuple[str, ...]) -> str:
+    """Drop a leading top-level heading (e.g. '# Summary') if present."""
+    text = md.strip()
+    for h in heading_starts:
+        if text.startswith(h):
+            nl = text.find("\n")
+            if nl >= 0:
+                text = text[nl + 1 :]
+            break
+    return text.strip()
+
+
+def compose_session_md(
+    session: Session,
+    *,
+    summary_md: str,
+    understanding_md: str,
+    timeline_md: str | None = None,
+) -> str:
+    """Combine summary + understanding + (optional) timeline into one document."""
+    if timeline_md is None:
+        timeline_md = build_timeline(session)
+
+    started_time = ""
+    if session.started_at:
+        try:
+            started_time = session.started_at.split("T")[1][:5]
+        except Exception:
+            started_time = ""
+
+    metadata_bits: list[str] = []
+    if started_time:
+        metadata_bits.append(f"started {started_time}")
+    if session.cwd:
+        metadata_bits.append(f"cwd: `{session.cwd}`")
+    if session.git_branch:
+        metadata_bits.append(f"branch: `{session.git_branch}`")
+    metadata_bits.append(f"{len(session.events)} events")
+    metadata_bits.append(f"{len(session.user_prompts)} prompts")
+    metadata_bits.append(f"{len(session.tool_uses)} tool calls")
+
+    parts = [
+        f"# Session {session.short_id} — {session.date_prefix}",
+        "",
+        f"_{' · '.join(metadata_bits)}_",
+        "",
+        "## Summary",
+        "",
+        _strip_top_heading(summary_md, ("# Summary",)),
+        "",
+        "## Understanding",
+        "",
+        _strip_top_heading(understanding_md, ("# Understanding",)),
+        "",
+        "## Timeline",
+        "",
+        _strip_top_heading(
+            timeline_md, (f"# Timeline — `{session.session_id}`", "# Timeline")
+        ),
+        "",
+    ]
+    return "\n".join(parts)
+
+
+def write_session_md(session: Session, out_path: Path, **kw) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(compose_session_md(session, **kw))
+    return out_path

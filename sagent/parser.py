@@ -47,6 +47,24 @@ class Session:
     def tool_uses(self) -> list[Event]:
         return [e for e in self.events if e.kind == "tool_use"]
 
+    @property
+    def started_at(self) -> str | None:
+        for e in self.events:
+            if e.timestamp:
+                return e.timestamp
+        return None
+
+    @property
+    def date_prefix(self) -> str:
+        ts = self.started_at
+        if not ts:
+            return "0000-00-00"
+        return ts.split("T")[0]
+
+    @property
+    def short_id(self) -> str:
+        return self.session_id.split("-")[0][:8]
+
 
 def _content_blocks(msg: dict) -> list[dict]:
     c = msg.get("content")

@@ -7,10 +7,11 @@ import socket
 import sys
 from pathlib import Path
 
-from .digest import write_timeline
+from .digest import build_timeline, write_session_md
 from .parser import load_session
+from .rollup import is_scratchpad, roll_up_project, update_recent
 from .state import StateStore, default_state_path
-from .understand import write_understanding
+from .understand import run_understanding
 from .watcher import (
     CLAUDE_PROJECTS,
     DEFAULT_QUIET_SECONDS,
@@ -65,17 +66,19 @@ def _resolve_input(arg: str | None) -> Path:
     sys.exit(f"could not resolve: {arg}")
 
 
-def _out_dir_for(session_path: Path, base: Path) -> Path:
-    return base / _clean_project_name(session_path.parent.name) / session_path.stem
+def _project_dir_for(session_path: Path, base: Path) -> Path:
+    """Output dir for the project this session belongs to."""
+    return base / _clean_project_name(session_path.parent.name)
 
 
-def _read_prior(out_dir: Path) -> tuple[str, str]:
-    s = out_dir / "summary.md"
-    u = out_dir / "understanding.md"
-    return (
-        s.read_text() if s.exists() else "",
-        u.read_text() if u.exists() else "",
-    )
+def _existing_session_md(project_dir: Path, session_id: str) -> Path | None:
+    """Find an existing per-session digest matching this UUID's short id8."""
+    sessions_dir = project_dir / "sessions"
+    if not sessions_dir.exists():
+        return None
+    short = session_id.split("-")[0][:8]
+    matches = list(sessions_dir.glob(f"*-{short}.md"))
+    return matches[0] if matches else None
 
 
 def _digest_one(
@@ -89,6 +92,7 @@ def _digest_one(
     full_rebuild_every: int = 10,
     min_delta: int = 0,
     min_prompts: int = 1,
+    skip_rollup: bool = False,
     verbose: bool = True,
 ) -> None:
     try:
@@ -106,16 +110,18 @@ def _digest_one(
         return
 
     session = load_session(session_path)
+    project_dir = _project_dir_for(session_path, out_root)
 
+    # Drop empty/trivial sessions
     if len(session.user_prompts) < min_prompts:
         if verbose:
             print(
                 f"[sagent] {session_path.name} has {len(session.user_prompts)} "
                 f"user prompts (< {min_prompts}), dropping"
             )
-        out = _out_dir_for(session_path, out_root)
-        if out.exists():
-            shutil.rmtree(out)
+        existing = _existing_session_md(project_dir, session.session_id)
+        if existing and existing.exists():
+            existing.unlink()
         if state is not None:
             state.mark_digested(
                 session_path, size=current_size, event_index=len(session.events)
@@ -123,17 +129,25 @@ def _digest_one(
             state.save()
         return
 
-    out = _out_dir_for(session_path, out_root)
+    sess_filename = f"{session.date_prefix}-{session.short_id}.md"
+    out_path = project_dir / "sessions" / sess_filename
+
     if verbose:
-        print(f"[sagent] {session_path.name} → {out}")
-    write_timeline(session, out)
+        print(f"[sagent] {session_path.name} → {out_path.relative_to(out_root)}")
+
+    timeline_md = build_timeline(session)
 
     if no_llm:
+        write_session_md(
+            session,
+            out_path,
+            summary_md="(LLM digest skipped — `--no-llm`)\n",
+            understanding_md="",
+            timeline_md=timeline_md,
+        )
         if state is not None:
             state.mark_digested(
-                session_path,
-                size=current_size,
-                event_index=len(session.events),
+                session_path, size=current_size, event_index=len(session.events)
             )
             state.save()
         return
@@ -148,11 +162,16 @@ def _digest_one(
         and not force_full
         and (full_rebuild_every <= 0 or (digest_count + 1) % full_rebuild_every != 0)
     )
-
+    prior_summary = ""
+    prior_understanding = ""
     if do_incremental:
-        prior_summary, prior_understanding = _read_prior(out)
+        existing = _existing_session_md(project_dir, session.session_id)
+        if existing and existing.exists():
+            prior_text = existing.read_text()
+            # Extract the previous Summary and Understanding sections
+            prior_summary, prior_understanding = _extract_prior_sections(prior_text)
         if not prior_summary.strip():
-            do_incremental = False  # missing prior on disk; fall back to cold
+            do_incremental = False
 
     try:
         if do_incremental:
@@ -160,12 +179,11 @@ def _digest_one(
             new_count = len(session.events) - rec.last_event_index
             if verbose:
                 print(
-                    f"  … incremental update ({new_count} new events, "
+                    f"  … incremental ({new_count} new events, "
                     f"prior at index {rec.last_event_index})"
                 )
-            write_understanding(
+            summary_md, understanding_md = run_understanding(
                 session,
-                out,
                 model=model,
                 prior_summary=prior_summary,
                 prior_understanding=prior_understanding,
@@ -179,17 +197,90 @@ def _digest_one(
                     else "cold start"
                 )
                 print(f"  … full digest ({reason})")
-            write_understanding(session, out, model=model)
+            summary_md, understanding_md = run_understanding(session, model=model)
     except Exception as exc:
         print(f"[sagent] understanding failed for {session_path.name}: {exc}")
         return
 
+    write_session_md(
+        session,
+        out_path,
+        summary_md=summary_md,
+        understanding_md=understanding_md,
+        timeline_md=timeline_md,
+    )
+
     if state is not None:
         state.mark_digested(
-            session_path,
-            size=session_path.stat().st_size,
-            event_index=len(session.events),
+            session_path, size=current_size, event_index=len(session.events)
         )
+        state.save()
+
+    # Project-level roll-up (or scratchpad recent.md)
+    if skip_rollup:
+        return
+    try:
+        _maybe_rollup(
+            project_dir=project_dir,
+            new_session_path=out_path,
+            session_id=session.session_id,
+            model=model,
+            state=state,
+            force_full=force_full,
+            full_rebuild_every=full_rebuild_every,
+            verbose=verbose,
+        )
+    except Exception as exc:
+        print(f"[sagent] roll-up failed for {project_dir.name}: {exc}")
+
+
+def _extract_prior_sections(session_md: str) -> tuple[str, str]:
+    """Pull the '## Summary' and '## Understanding' bodies from a per-session
+    combined digest."""
+    import re
+
+    def _section(name: str) -> str:
+        m = re.search(rf"^## {name}\s*$\n+(.*?)(?=\n## |\Z)", session_md, re.M | re.S)
+        return m.group(1).strip() if m else ""
+
+    return _section("Summary"), _section("Understanding")
+
+
+def _maybe_rollup(
+    *,
+    project_dir: Path,
+    new_session_path: Path,
+    session_id: str,
+    model: str,
+    state: StateStore | None,
+    force_full: bool,
+    full_rebuild_every: int,
+    verbose: bool,
+) -> None:
+    if is_scratchpad(project_dir.name):
+        update_recent(project_dir)
+        if verbose:
+            print(f"  ✓ updated {project_dir.name}/recent.md")
+        return
+
+    rollup_count = 0
+    if state is not None:
+        prec = state.get_project(project_dir.name)
+        if prec:
+            rollup_count = prec.rollup_count
+
+    if verbose:
+        print(f"  … rolling up {project_dir.name}/project.md")
+    roll_up_project(
+        project_dir,
+        new_session_path=new_session_path,
+        model=model,
+        force_full=force_full,
+        full_rebuild_every=full_rebuild_every,
+        rollup_count=rollup_count,
+    )
+    if state is not None:
+        state.mark_rolled_up(project_dir.name, session_id=session_id)
         state.save()
 
 
@@ -212,6 +303,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
         force_full=args.force_full,
         full_rebuild_every=args.full_rebuild_every,
         min_prompts=args.min_prompts,
+        skip_rollup=args.skip_rollup,
     )
     return 0
 
@@ -231,7 +323,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
             full_rebuild_every=args.full_rebuild_every,
             min_prompts=args.min_prompts,
         )
-        print(f"[sagent] digested → {_out_dir_for(path, out_root)}")
 
     if args.target:
         p = Path(args.target).expanduser()
@@ -315,8 +406,65 @@ def cmd_digest_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rollup(args: argparse.Namespace) -> int:
+    """Re-run the project-level roll-up against existing per-session digests.
+
+    Useful after migration or to force-refresh a stale project.md.
+    """
+    out_root = Path(args.out) if args.out else default_out_dir()
+    state = _make_state(args) if not args.no_state else None
+    project_filter = args.project
+
+    if not out_root.exists():
+        sys.exit(f"no output at {out_root}")
+
+    for project_dir in sorted(out_root.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        if project_filter and project_dir.name != project_filter:
+            continue
+        sessions_dir = project_dir / "sessions"
+        if not sessions_dir.exists() or not any(sessions_dir.glob("*.md")):
+            continue
+
+        if is_scratchpad(project_dir.name):
+            print(f"[sagent] {project_dir.name} (scratchpad) → recent.md")
+            update_recent(project_dir)
+            continue
+
+        latest = max(sessions_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
+        rollup_count = 0
+        if state is not None:
+            prec = state.get_project(project_dir.name)
+            if prec:
+                rollup_count = prec.rollup_count
+        print(f"[sagent] {project_dir.name} → project.md (force_full={args.force_full})")
+        roll_up_project(
+            project_dir,
+            new_session_path=latest,
+            model=args.model,
+            force_full=args.force_full,
+            full_rebuild_every=args.full_rebuild_every,
+            rollup_count=rollup_count,
+        )
+        if state is not None:
+            # use the latest session's id8 as the marker
+            import re
+
+            m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", latest.name)
+            if m:
+                state.mark_rolled_up(project_dir.name, session_id=m.group(1))
+                state.save()
+
+    return 0
+
+
 def cmd_prune(args: argparse.Namespace) -> int:
-    """Remove output dirs whose source session has too few user prompts."""
+    """Remove per-session .md files whose source has too few user prompts.
+
+    Walks <project>/sessions/*.md, derives the source UUID from the filename,
+    re-parses the source JSONL, and drops the .md if user_prompts < min.
+    """
     out_root = Path(args.out) if args.out else default_out_dir()
     state = _make_state(args) if not args.no_state else None
 
@@ -324,25 +472,30 @@ def cmd_prune(args: argparse.Namespace) -> int:
         print(f"[sagent] nothing at {out_root}")
         return 0
 
+    import re
+
     removed = 0
     kept = 0
     orphaned = 0
     for proj_dir in sorted(out_root.iterdir()):
         if not proj_dir.is_dir():
             continue
-        for sess_dir in sorted(proj_dir.iterdir()):
-            if not sess_dir.is_dir():
+        sessions_dir = proj_dir / "sessions"
+        if not sessions_dir.exists():
+            continue
+        for md in sorted(sessions_dir.glob("*.md")):
+            m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", md.name)
+            if not m:
                 continue
-            # Find source JSONL — session IDs are UUIDs so a single glob hit
-            matches = list(CLAUDE_PROJECTS.glob(f"*/{sess_dir.name}.jsonl"))
+            short = m.group(1)
+            matches = list(CLAUDE_PROJECTS.glob(f"*/{short}*.jsonl"))
             if not matches:
                 orphaned += 1
                 if args.prune_orphans:
                     if args.dry_run:
-                        print(f"  [orphan] would remove {sess_dir}")
+                        print(f"  [orphan] would remove {md.relative_to(out_root)}")
                     else:
-                        shutil.rmtree(sess_dir)
-                        print(f"  [orphan] removed {sess_dir}")
+                        md.unlink()
                         removed += 1
                 continue
             source = matches[0]
@@ -350,11 +503,11 @@ def cmd_prune(args: argparse.Namespace) -> int:
             if len(session.user_prompts) < args.min_prompts:
                 if args.dry_run:
                     print(
-                        f"  would remove {sess_dir.relative_to(out_root)} "
+                        f"  would remove {md.relative_to(out_root)} "
                         f"({len(session.user_prompts)} prompts)"
                     )
                 else:
-                    shutil.rmtree(sess_dir)
+                    md.unlink()
                     if state is not None:
                         state.mark_digested(
                             source,
@@ -369,7 +522,11 @@ def cmd_prune(args: argparse.Namespace) -> int:
     verb = "would remove" if args.dry_run else "removed"
     print(
         f"[sagent] {verb} {removed}, kept {kept}, orphans {orphaned}"
-        + (" (use --prune-orphans to remove those too)" if orphaned and not args.prune_orphans else "")
+        + (
+            " (use --prune-orphans to remove those too)"
+            if orphaned and not args.prune_orphans
+            else ""
+        )
     )
     return 0
 
@@ -384,7 +541,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         sessions = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         if not sessions:
             continue
-        print(f"{proj.name}  ({len(sessions)} sessions)")
+        kind = "scratchpad" if is_scratchpad(proj.name) else "project"
+        print(f"{proj.name}  ({len(sessions)} sessions, {kind})")
         if args.verbose:
             for s in sessions[-3:]:
                 print(f"  {s.name}  {s.stat().st_size:>10} bytes")
@@ -446,6 +604,11 @@ def main(argv: list[str] | None = None) -> int:
     pd.add_argument("--out", default=None, help=out_help)
     pd.add_argument("--model", **common_model)
     pd.add_argument("--no-llm", action="store_true", help="skip LLM understanding")
+    pd.add_argument(
+        "--skip-rollup",
+        action="store_true",
+        help="skip the project-level project.md / recent.md update",
+    )
     _add_min_prompts_arg(pd)
     _add_state_args(pd)
     pd.set_defaults(func=cmd_digest)
@@ -513,8 +676,20 @@ def main(argv: list[str] | None = None) -> int:
     _add_state_args(pwa)
     pwa.set_defaults(func=cmd_watch_all)
 
+    pru = sub.add_parser(
+        "rollup",
+        help="re-run project-level roll-up against existing per-session digests",
+    )
+    pru.add_argument(
+        "project", nargs="?", help="project dir name (defaults to all projects)"
+    )
+    pru.add_argument("--out", default=None, help=out_help)
+    pru.add_argument("--model", **common_model)
+    _add_state_args(pru)
+    pru.set_defaults(func=cmd_rollup)
+
     ppr = sub.add_parser(
-        "prune", help="delete output dirs for sessions with no real content"
+        "prune", help="delete per-session digests whose source has no real content"
     )
     ppr.add_argument("--out", default=None, help=out_help)
     ppr.add_argument(
@@ -525,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     ppr.add_argument(
         "--prune-orphans",
         action="store_true",
-        help="also remove output dirs whose source JSONL no longer exists",
+        help="also remove digests whose source JSONL no longer exists",
     )
     _add_min_prompts_arg(ppr)
     _add_state_args(ppr)

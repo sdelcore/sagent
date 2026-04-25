@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 from .parser import Event, Session
 
@@ -166,25 +165,3 @@ def run_understanding(
     return _split_output(text)
 
 
-def write_understanding(
-    session: Session,
-    out_dir: Path,
-    model: str = "claude-haiku-4-5",
-    *,
-    prior_summary: str = "",
-    prior_understanding: str = "",
-    since_event_index: int = 0,
-) -> tuple[Path, Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    summary, understanding = run_understanding(
-        session,
-        model=model,
-        prior_summary=prior_summary,
-        prior_understanding=prior_understanding,
-        since_event_index=since_event_index,
-    )
-    summary_path = out_dir / "summary.md"
-    understanding_path = out_dir / "understanding.md"
-    summary_path.write_text(summary)
-    understanding_path.write_text(understanding)
-    return summary_path, understanding_path

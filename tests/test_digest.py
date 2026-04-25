@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sagent.digest import _tool_summary, _truncate, build_timeline, write_timeline
+from sagent.digest import (
+    _tool_summary,
+    _truncate,
+    build_timeline,
+    compose_session_md,
+)
 from sagent.parser import Event, Session, load_session
 
 
@@ -116,10 +121,19 @@ def test_build_timeline_contains_key_sections(tmp_path: Path):
     assert "**Claude:** on it" in out
 
 
-def test_write_timeline_creates_file(tmp_path: Path):
+def test_compose_session_md_combines_sections(tmp_path: Path):
     sess = _mini_session(tmp_path)
-    out_dir = tmp_path / "out"
-    path = write_timeline(sess, out_dir)
-    assert path.exists()
-    assert path.name == "timeline.md"
-    assert "# Timeline" in path.read_text()
+    out = compose_session_md(
+        sess,
+        summary_md="# Summary\n\nUser asked to build something.",
+        understanding_md="# Understanding\n\n## Decisions\n- Built it",
+        timeline_md=build_timeline(sess),
+    )
+    assert "# Session " in out
+    assert "## Summary" in out
+    assert "User asked to build something." in out
+    assert "## Understanding" in out
+    assert "Built it" in out
+    assert "## Timeline" in out
+    # Top-level "# Summary" should be stripped (section heading replaced)
+    assert out.count("# Summary") == 1  # only as substring of "## Summary"
