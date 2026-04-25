@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .parser import Event, Session
 
-UNDERSTANDING_SYSTEM = """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
+UNDERSTANDING_BASE = """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
 
 You produce two documents in one response, separated by a line containing exactly `---UNDERSTANDING---`:
 
@@ -35,6 +35,22 @@ Rules:
 - Do not repeat the timeline. Extract signal.
 - No preamble, no meta commentary about the document itself."""
 
+UNDERSTANDING_INCREMENTAL_SUFFIX = """
+
+INCREMENTAL UPDATE MODE
+You are updating an existing digest. The user message contains:
+1. The PRIOR SUMMARY (from the previous digest pass)
+2. The PRIOR UNDERSTANDING (from the previous digest pass)
+3. NEW EVENTS that occurred after the prior digest
+
+Produce an updated full digest (Summary + Understanding) that:
+- Preserves prior content that is still accurate.
+- Updates or replaces prior content where new events change the state of things (e.g. an open thread was resolved, a decision was reversed, a new file was committed).
+- Adds anything new from the new events.
+- Removes prior content only if the new events contradict it; otherwise leave it.
+
+Output the FULL updated documents in the same format as a fresh digest. Do not output a diff. Do not say "no changes" — always produce both documents."""
+
 
 def _render_event(e: Event, idx: int) -> str:
     ts = (e.timestamp or "").split("T")[-1].rstrip("Z").split(".")[0]
@@ -54,20 +70,24 @@ def _render_event(e: Event, idx: int) -> str:
     return f"[{idx} {ts}] {e.kind}: {e.text[:200]}"
 
 
-def build_transcript(session: Session, max_chars: int = 120_000) -> str:
+def build_transcript(
+    events: list[Event],
+    max_chars: int = 120_000,
+    start_index: int = 0,
+) -> str:
     blocks: list[str] = []
     total = 0
-    for i, e in enumerate(session.events):
-        block = _render_event(e, i)
+    for offset, e in enumerate(events):
+        block = _render_event(e, start_index + offset)
         total += len(block)
         if total > max_chars:
-            blocks.append(f"... [{len(session.events) - i} further events truncated]")
+            blocks.append(f"... [{len(events) - offset} further events truncated]")
             break
         blocks.append(block)
     return "\n\n".join(blocks)
 
 
-async def _run_via_sdk_async(system: str, user_message: str, model: str) -> str:
+async def _query_async(system: str, user_message: str, model: str) -> str:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -97,24 +117,7 @@ async def _run_via_sdk_async(system: str, user_message: str, model: str) -> str:
     return text or final_result
 
 
-def run_understanding(
-    session: Session,
-    model: str = "claude-haiku-4-5",
-) -> tuple[str, str]:
-    """Returns (summary_md, understanding_md).
-
-    The Agent SDK authenticates via (in priority order): ANTHROPIC_API_KEY,
-    CLAUDE_CODE_OAUTH_TOKEN, or the existing `~/.claude/` OAuth login.
-    """
-    transcript = build_transcript(session)
-    user_message = (
-        f"Session `{session.session_id}` "
-        f"(cwd: `{session.cwd}`, branch: `{session.git_branch}`)\n\n"
-        f"Transcript:\n\n{transcript}"
-    )
-
-    text = asyncio.run(_run_via_sdk_async(UNDERSTANDING_SYSTEM, user_message, model))
-
+def _split_output(text: str) -> tuple[str, str]:
     sep = "---UNDERSTANDING---"
     if sep in text:
         summary, understanding = text.split(sep, 1)
@@ -123,13 +126,63 @@ def run_understanding(
     return summary.strip() + "\n", understanding.strip() + "\n"
 
 
+def run_understanding(
+    session: Session,
+    model: str = "claude-haiku-4-5",
+    *,
+    prior_summary: str = "",
+    prior_understanding: str = "",
+    since_event_index: int = 0,
+) -> tuple[str, str]:
+    """Returns (summary_md, understanding_md).
+
+    If `prior_summary` is non-empty, runs in incremental mode: only events
+    from `since_event_index` onward are sent to the LLM, along with the
+    prior digest documents. Otherwise runs cold (full transcript).
+    """
+    is_incremental = bool(prior_summary.strip())
+    new_events = session.events[since_event_index:] if is_incremental else session.events
+
+    transcript = build_transcript(new_events, start_index=since_event_index)
+    header = (
+        f"Session `{session.session_id}` "
+        f"(cwd: `{session.cwd}`, branch: `{session.git_branch}`)\n\n"
+    )
+
+    if is_incremental:
+        system = UNDERSTANDING_BASE + UNDERSTANDING_INCREMENTAL_SUFFIX
+        user_message = (
+            f"{header}"
+            f"PRIOR SUMMARY:\n{prior_summary.strip()}\n\n"
+            f"PRIOR UNDERSTANDING:\n{prior_understanding.strip()}\n\n"
+            f"NEW EVENTS (indices {since_event_index}–{len(session.events) - 1}):\n\n"
+            f"{transcript}"
+        )
+    else:
+        system = UNDERSTANDING_BASE
+        user_message = f"{header}Transcript:\n\n{transcript}"
+
+    text = asyncio.run(_query_async(system, user_message, model))
+    return _split_output(text)
+
+
 def write_understanding(
     session: Session,
     out_dir: Path,
     model: str = "claude-haiku-4-5",
+    *,
+    prior_summary: str = "",
+    prior_understanding: str = "",
+    since_event_index: int = 0,
 ) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary, understanding = run_understanding(session, model=model)
+    summary, understanding = run_understanding(
+        session,
+        model=model,
+        prior_summary=prior_summary,
+        prior_understanding=prior_understanding,
+        since_event_index=since_event_index,
+    )
     summary_path = out_dir / "summary.md"
     understanding_path = out_dir / "understanding.md"
     summary_path.write_text(summary)

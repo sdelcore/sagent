@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Callable
 
+from .state import StateStore
+
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+DEFAULT_QUIET_SECONDS = 300.0  # 5 minutes; "summarize when a session goes idle"
 
 
 def project_dir_for_cwd(cwd: str | Path) -> Path:
@@ -26,16 +29,13 @@ def watch(
     target: Path,
     on_change: Callable[[Path], None],
     interval: float = 2.0,
-    quiet_seconds: float = 3.0,
+    quiet_seconds: float = DEFAULT_QUIET_SECONDS,
 ) -> None:
-    """Poll a JSONL file; fire on_change after writes settle for quiet_seconds.
-
-    Settling avoids re-running the digest on every append during an active turn.
-    """
+    """Poll a JSONL file; fire on_change after writes settle for quiet_seconds."""
     last_size = -1
     last_change_at = 0.0
     fired_for_size = -1
-    print(f"[sagent] watching {target}")
+    print(f"[sagent] watching {target} (idle threshold: {quiet_seconds}s)")
     while True:
         try:
             size = target.stat().st_size if target.exists() else 0
@@ -62,10 +62,10 @@ def watch_project(
     project_dir: Path,
     on_change: Callable[[Path], None],
     interval: float = 2.0,
-    quiet_seconds: float = 3.0,
+    quiet_seconds: float = DEFAULT_QUIET_SECONDS,
 ) -> None:
     """Follow whichever session is most recent in project_dir."""
-    print(f"[sagent] watching project dir {project_dir}")
+    print(f"[sagent] watching project dir {project_dir} (idle: {quiet_seconds}s)")
     current: Path | None = None
     last_size = -1
     last_change_at = 0.0
@@ -106,21 +106,33 @@ def watch_all(
     on_change: Callable[[Path], None],
     root: Path = CLAUDE_PROJECTS,
     interval: float = 2.0,
-    quiet_seconds: float = 3.0,
+    quiet_seconds: float = DEFAULT_QUIET_SECONDS,
     min_bytes: int = 5_000,
+    min_delta: int = 0,
+    state: StateStore | None = None,
 ) -> None:
     """Watch every project under root, digesting each session when it settles.
 
-    Tracks per-file sizes; fires on_change once per file after writes settle.
-    Picks up new project directories and new sessions as they appear.
-    Skips sessions below `min_bytes` — Claude Code writes stub JSONLs
-    (permission-mode, file-history-snapshot records only) on every
-    invocation and those are noise.
+    If a `state` is provided, sessions already digested at their current size
+    (per the state file) are skipped on startup — no re-digest cost across
+    service restarts.
     """
-    print(f"[sagent] watch-all: {root} (skip < {min_bytes} bytes)")
+    print(
+        f"[sagent] watch-all: {root} "
+        f"(skip < {min_bytes} bytes, idle: {quiet_seconds}s, "
+        f"min-delta: {min_delta})"
+    )
+
     last_size: dict[Path, int] = {}
     last_change_at: dict[Path, float] = {}
     fired_for_size: dict[Path, int] = {}
+
+    if state is not None:
+        for path_str, rec in state.sessions.items():
+            fired_for_size[Path(path_str)] = rec.last_digested_size
+        if state.sessions:
+            print(f"[sagent] hydrated {len(state.sessions)} session(s) from state")
+
     while True:
         if not root.exists():
             time.sleep(interval)
@@ -135,6 +147,12 @@ def watch_all(
                 except FileNotFoundError:
                     continue
                 if size < min_bytes:
+                    continue
+                if state is not None and state.should_skip(
+                    sess, size=size, min_delta=min_delta
+                ):
+                    fired_for_size[sess] = size
+                    last_size[sess] = size
                     continue
                 prev = last_size.get(sess, -1)
                 if size != prev:
