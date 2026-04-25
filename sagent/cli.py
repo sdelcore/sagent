@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import sys
 from pathlib import Path
@@ -87,6 +88,7 @@ def _digest_one(
     force_full: bool = False,
     full_rebuild_every: int = 10,
     min_delta: int = 0,
+    min_prompts: int = 1,
     verbose: bool = True,
 ) -> None:
     try:
@@ -104,6 +106,23 @@ def _digest_one(
         return
 
     session = load_session(session_path)
+
+    if len(session.user_prompts) < min_prompts:
+        if verbose:
+            print(
+                f"[sagent] {session_path.name} has {len(session.user_prompts)} "
+                f"user prompts (< {min_prompts}), dropping"
+            )
+        out = _out_dir_for(session_path, out_root)
+        if out.exists():
+            shutil.rmtree(out)
+        if state is not None:
+            state.mark_digested(
+                session_path, size=current_size, event_index=len(session.events)
+            )
+            state.save()
+        return
+
     out = _out_dir_for(session_path, out_root)
     if verbose:
         print(f"[sagent] {session_path.name} → {out}")
@@ -192,6 +211,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
         state=state,
         force_full=args.force_full,
         full_rebuild_every=args.full_rebuild_every,
+        min_prompts=args.min_prompts,
     )
     return 0
 
@@ -209,6 +229,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             state=state,
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
+            min_prompts=args.min_prompts,
         )
         print(f"[sagent] digested → {_out_dir_for(path, out_root)}")
 
@@ -243,6 +264,7 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
             state=state,
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
+            min_prompts=args.min_prompts,
         )
 
     watch_all(
@@ -286,9 +308,69 @@ def cmd_digest_all(args: argparse.Namespace) -> int:
                 state=state,
                 force_full=args.force_full,
                 full_rebuild_every=args.full_rebuild_every,
+                min_prompts=args.min_prompts,
             )
             count += 1
     print(f"[sagent] digested {count}; skipped {skipped} already-digested")
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Remove output dirs whose source session has too few user prompts."""
+    out_root = Path(args.out) if args.out else default_out_dir()
+    state = _make_state(args) if not args.no_state else None
+
+    if not out_root.exists():
+        print(f"[sagent] nothing at {out_root}")
+        return 0
+
+    removed = 0
+    kept = 0
+    orphaned = 0
+    for proj_dir in sorted(out_root.iterdir()):
+        if not proj_dir.is_dir():
+            continue
+        for sess_dir in sorted(proj_dir.iterdir()):
+            if not sess_dir.is_dir():
+                continue
+            # Find source JSONL — session IDs are UUIDs so a single glob hit
+            matches = list(CLAUDE_PROJECTS.glob(f"*/{sess_dir.name}.jsonl"))
+            if not matches:
+                orphaned += 1
+                if args.prune_orphans:
+                    if args.dry_run:
+                        print(f"  [orphan] would remove {sess_dir}")
+                    else:
+                        shutil.rmtree(sess_dir)
+                        print(f"  [orphan] removed {sess_dir}")
+                        removed += 1
+                continue
+            source = matches[0]
+            session = load_session(source)
+            if len(session.user_prompts) < args.min_prompts:
+                if args.dry_run:
+                    print(
+                        f"  would remove {sess_dir.relative_to(out_root)} "
+                        f"({len(session.user_prompts)} prompts)"
+                    )
+                else:
+                    shutil.rmtree(sess_dir)
+                    if state is not None:
+                        state.mark_digested(
+                            source,
+                            size=source.stat().st_size,
+                            event_index=len(session.events),
+                        )
+                removed += 1
+            else:
+                kept += 1
+    if state is not None and not args.dry_run:
+        state.save()
+    verb = "would remove" if args.dry_run else "removed"
+    print(
+        f"[sagent] {verb} {removed}, kept {kept}, orphans {orphaned}"
+        + (" (use --prune-orphans to remove those too)" if orphaned and not args.prune_orphans else "")
+    )
     return 0
 
 
@@ -307,6 +389,15 @@ def cmd_list(args: argparse.Namespace) -> int:
             for s in sessions[-3:]:
                 print(f"  {s.name}  {s.stat().st_size:>10} bytes")
     return 0
+
+
+def _add_min_prompts_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--min-prompts",
+        type=int,
+        default=1,
+        help="drop sessions with fewer than this many user prompts (default: 1)",
+    )
 
 
 def _add_state_args(p: argparse.ArgumentParser) -> None:
@@ -355,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     pd.add_argument("--out", default=None, help=out_help)
     pd.add_argument("--model", **common_model)
     pd.add_argument("--no-llm", action="store_true", help="skip LLM understanding")
+    _add_min_prompts_arg(pd)
     _add_state_args(pd)
     pd.set_defaults(func=cmd_digest)
 
@@ -374,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="skip if file grew less than this many bytes since last digest",
     )
+    _add_min_prompts_arg(pda)
     _add_state_args(pda)
     pda.set_defaults(func=cmd_digest_all)
 
@@ -388,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_QUIET_SECONDS,
         help=f"idle threshold before digesting (default: {DEFAULT_QUIET_SECONDS:.0f}s)",
     )
+    _add_min_prompts_arg(pw)
     _add_state_args(pw)
     pw.set_defaults(func=cmd_watch)
 
@@ -415,8 +509,27 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_QUIET_SECONDS,
         help=f"idle threshold before digesting (default: {DEFAULT_QUIET_SECONDS:.0f}s)",
     )
+    _add_min_prompts_arg(pwa)
     _add_state_args(pwa)
     pwa.set_defaults(func=cmd_watch_all)
+
+    ppr = sub.add_parser(
+        "prune", help="delete output dirs for sessions with no real content"
+    )
+    ppr.add_argument("--out", default=None, help=out_help)
+    ppr.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be removed without deleting",
+    )
+    ppr.add_argument(
+        "--prune-orphans",
+        action="store_true",
+        help="also remove output dirs whose source JSONL no longer exists",
+    )
+    _add_min_prompts_arg(ppr)
+    _add_state_args(ppr)
+    ppr.set_defaults(func=cmd_prune)
 
     pl = sub.add_parser("list", help="list Claude Code projects with sessions")
     pl.add_argument("-v", "--verbose", action="store_true")
