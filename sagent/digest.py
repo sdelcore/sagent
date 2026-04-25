@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from pathlib import Path
 
+from .frontmatter import to_front_matter
 from .parser import Event, Session
 
 
@@ -113,23 +115,60 @@ def _strip_top_heading(md: str, heading_starts: tuple[str, ...]) -> str:
     return text.strip()
 
 
+def _gist_from_summary(summary_md: str, max_chars: int = 200) -> str:
+    """Extract the first sentence of the summary for the front-matter gist."""
+    body = _strip_top_heading(summary_md, ("# Summary",))
+    body = body.strip()
+    if not body:
+        return ""
+    # First non-empty line, then first sentence-ish chunk
+    line = next((l for l in body.splitlines() if l.strip()), "")
+    line = line.strip().lstrip("#").strip()
+    m = re.search(r"[.!?](\s|$)", line)
+    if m:
+        line = line[: m.start() + 1]
+    if len(line) > max_chars:
+        line = line[: max_chars - 1] + "…"
+    return line
+
+
 def compose_session_md(
     session: Session,
     *,
     summary_md: str,
     understanding_md: str,
-    timeline_md: str | None = None,
+    project: str,
+    source: str = "claude-code",
+    timeline_md: str | None = None,  # accepted but ignored; kept for API stability
 ) -> str:
-    """Combine summary + understanding + (optional) timeline into one document."""
-    if timeline_md is None:
-        timeline_md = build_timeline(session)
+    """Combine summary + understanding into one document with YAML front matter.
 
+    Timeline is no longer embedded — agents/humans wanting forensics should
+    read the source JSONL referenced in front matter (`source_jsonl`).
+    """
     started_time = ""
     if session.started_at:
         try:
             started_time = session.started_at.split("T")[1][:5]
         except Exception:
             started_time = ""
+
+    fm = {
+        "type": "session",
+        "source": source,
+        "session_id": session.session_id,
+        "short_id": session.short_id,
+        "date": session.date_prefix,
+        "started_at": session.started_at or "",
+        "project": project,
+        "cwd": session.cwd or "",
+        "branch": session.git_branch or "",
+        "events": len(session.events),
+        "prompts": len(session.user_prompts),
+        "tools": len(session.tool_uses),
+        "gist": _gist_from_summary(summary_md),
+        "source_jsonl": str(session.path),
+    }
 
     metadata_bits: list[str] = []
     if started_time:
@@ -142,7 +181,7 @@ def compose_session_md(
     metadata_bits.append(f"{len(session.user_prompts)} prompts")
     metadata_bits.append(f"{len(session.tool_uses)} tool calls")
 
-    parts = [
+    body_parts = [
         f"# Session {session.short_id} — {session.date_prefix}",
         "",
         f"_{' · '.join(metadata_bits)}_",
@@ -155,14 +194,8 @@ def compose_session_md(
         "",
         _strip_top_heading(understanding_md, ("# Understanding",)),
         "",
-        "## Timeline",
-        "",
-        _strip_top_heading(
-            timeline_md, (f"# Timeline — `{session.session_id}`", "# Timeline")
-        ),
-        "",
     ]
-    return "\n".join(parts)
+    return to_front_matter(fm) + "\n" + "\n".join(body_parts)
 
 
 def write_session_md(session: Session, out_path: Path, **kw) -> Path:

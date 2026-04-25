@@ -7,10 +7,10 @@ import socket
 import sys
 from pathlib import Path
 
-from .digest import build_timeline, write_session_md
+from .digest import write_session_md
 from .parser import load_session
 from .rate import RateLimiter, SagentRateLimitError
-from .rollup import is_scratchpad, roll_up_project, update_recent
+from .rollup import is_scratchpad, roll_up_project, update_index, update_recent
 from .state import StateStore, default_state_path
 from .understand import run_understanding
 from .watcher import (
@@ -155,7 +155,7 @@ def _digest_one(
     if verbose:
         print(f"[sagent] {session_path.name} → {out_path.relative_to(out_root)}")
 
-    timeline_md = build_timeline(session)
+    project_name = _clean_project_name(session_path.parent.name)
 
     if no_llm:
         write_session_md(
@@ -163,7 +163,7 @@ def _digest_one(
             out_path,
             summary_md="(LLM digest skipped — `--no-llm`)\n",
             understanding_md="",
-            timeline_md=timeline_md,
+            project=project_name,
         )
         if state is not None:
             state.mark_digested(
@@ -233,7 +233,7 @@ def _digest_one(
         out_path,
         summary_md=summary_md,
         understanding_md=understanding_md,
-        timeline_md=timeline_md,
+        project=project_name,
     )
 
     if state is not None:
@@ -291,6 +291,7 @@ def _maybe_rollup(
         update_recent(project_dir)
         if verbose:
             print(f"  ✓ updated {project_dir.name}/recent.md")
+        update_index(project_dir.parent)
         return
 
     rollup_count = 0
@@ -310,6 +311,7 @@ def _maybe_rollup(
         rollup_count=rollup_count,
         rate_limiter=rate_limiter,
     )
+    update_index(project_dir.parent)
     if state is not None:
         state.mark_rolled_up(project_dir.name, session_id=session_id)
         state.save()

@@ -3,7 +3,15 @@ from __future__ import annotations
 import getpass
 from pathlib import Path
 
-from sagent.rollup import _extract_gist, _first_sentence, is_scratchpad, update_recent
+from sagent.rollup import (
+    _count_section_bullets,
+    _extract_description_tagline,
+    _extract_gist,
+    _first_sentence,
+    is_scratchpad,
+    update_index,
+    update_recent,
+)
 
 
 def test_is_scratchpad_user_home():
@@ -83,3 +91,112 @@ def test_update_recent_handles_empty(tmp_path: Path):
     # No sessions/ dir → no-op, returns the would-be path
     assert out == tmp_path / "recent.md"
     assert not out.exists()
+
+
+def test_update_recent_emits_front_matter(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "2026-04-22-abc12345.md").write_text(
+        "## Summary\n\nDebugged X.\n"
+    )
+    out = update_recent(tmp_path)
+    text = out.read_text()
+    assert text.startswith("---\n")
+    assert 'type: "scratchpad"' in text
+    assert 'project: "' in text
+    assert "session_count_30d:" in text
+
+
+def test_extract_description_tagline_both_present():
+    body = (
+        "DESCRIPTION: A project that does X.\n"
+        "TAGLINE: Currently doing Y.\n"
+        "\n"
+        "# my project\n"
+        "\n"
+        "## Current state\n"
+        "Going well.\n"
+    )
+    desc, tag, rest = _extract_description_tagline(body)
+    assert desc == "A project that does X."
+    assert tag == "Currently doing Y."
+    assert rest.startswith("# my project")
+
+
+def test_extract_description_tagline_caps_at_280():
+    long_desc = "x" * 500
+    body = f"DESCRIPTION: {long_desc}\nTAGLINE: short\n\n# proj\n"
+    desc, _, _ = _extract_description_tagline(body)
+    assert len(desc) <= 280
+
+
+def test_extract_description_tagline_missing_lines_tolerated():
+    body = "# heading\nbody\n"
+    desc, tag, rest = _extract_description_tagline(body)
+    assert desc == ""
+    assert tag == ""
+    assert rest.startswith("# heading")
+
+
+def test_count_section_bullets():
+    body = (
+        "## Long-term decisions\n"
+        "- a\n"
+        "- b\n"
+        "- c\n"
+        "\n"
+        "## Open threads\n"
+        "- one\n"
+        "\n"
+        "## Risks & known issues\n"
+    )
+    counts = _count_section_bullets(body)
+    assert counts["Long-term decisions"] == 3
+    assert counts["Open threads"] == 1
+    assert counts["Risks & known issues"] == 0
+
+
+def test_update_index_lists_projects_and_scratchpads(tmp_path: Path):
+    # Build a fake host output dir with one project and one scratchpad
+    proj = tmp_path / "src-foo"
+    proj.mkdir()
+    (proj / "project.md").write_text(
+        '---\n'
+        'type: "project"\n'
+        'project: "src-foo"\n'
+        'description: "Foo project"\n'
+        'tagline: "in flight"\n'
+        'session_count: 4\n'
+        'sessions_last_7d: 2\n'
+        'decisions: 5\n'
+        'open_threads: 1\n'
+        'risks: 0\n'
+        'last_updated: "2026-04-25T10:00:00Z"\n'
+        '---\n'
+        '# src-foo\n'
+        '\n'
+        'body...\n'
+    )
+    scratch = tmp_path / "home-user"
+    scratch.mkdir()
+    (scratch / "recent.md").write_text(
+        '---\n'
+        'type: "scratchpad"\n'
+        'project: "home-user"\n'
+        'session_count_30d: 47\n'
+        'window_days: 30\n'
+        'last_updated: "2026-04-25T10:00:00Z"\n'
+        '---\n'
+        '# home-user — recent\n'
+    )
+
+    out = update_index(tmp_path)
+    assert out is not None
+    text = out.read_text()
+    assert "## Projects" in text
+    assert "src-foo" in text
+    assert "Foo project" in text
+    assert "in flight" in text
+    assert "## Scratchpads" in text
+    assert "home-user" in text
+    assert "47 sessions" in text

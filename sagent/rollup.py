@@ -16,6 +16,12 @@ import re
 import time
 from pathlib import Path
 
+from .frontmatter import (
+    cap_description,
+    split_front_matter,
+    strip_front_matter,
+    to_front_matter,
+)
 from .rate import RateLimiter
 from .understand import _query_async  # type: ignore[reportPrivateUsage]
 
@@ -110,11 +116,22 @@ def update_recent(
 
     out = project_dir / "recent.md"
     project_name = project_dir.name.lstrip("-")
+    total = sum(len(v) for v in by_date.values())
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    fm = {
+        "type": "scratchpad",
+        "source": "claude-code",
+        "project": project_name,
+        "last_updated": now,
+        "session_count_30d": total,
+        "window_days": days,
+    }
+
     lines: list[str] = [
         f"# {project_name} — recent",
         "",
-        f"_last updated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} · "
-        f"{sum(len(v) for v in by_date.values())} sessions in last {days} days_",
+        f"_last updated: {now} · {total} sessions in last {days} days_",
         "",
     ]
     for date in sorted(by_date.keys(), reverse=True):
@@ -124,6 +141,93 @@ def update_recent(
             prefix = f"{hhmm} " if hhmm else ""
             gist_str = f" — {gist}" if gist else ""
             lines.append(f"- {prefix}{link}{gist_str}")
+        lines.append("")
+
+    out.write_text(to_front_matter(fm) + "\n" + "\n".join(lines))
+    return out
+
+
+def update_index(out_root: Path) -> Path | None:
+    """Write a fleet-wide INDEX.md at out_root summarizing every project.
+
+    Reads YAML front matter from each <project>/project.md or recent.md and
+    builds a single-page overview with description/tagline/counts. Cheap —
+    no LLM calls.
+    """
+    if not out_root.exists() or not out_root.is_dir():
+        return None
+
+    projects: list[dict] = []
+    scratchpads: list[dict] = []
+    for proj_dir in sorted(out_root.iterdir()):
+        if not proj_dir.is_dir():
+            continue
+        for fname in ("project.md", "recent.md"):
+            fp = proj_dir / fname
+            if not fp.exists():
+                continue
+            fm, _ = split_front_matter(fp.read_text(errors="ignore"))
+            if not fm:
+                continue
+            fm["_dir"] = proj_dir.name
+            fm["_path"] = fname
+            if fm.get("type") == "scratchpad":
+                scratchpads.append(fm)
+            else:
+                projects.append(fm)
+            break  # one summary per project dir
+
+    out = out_root / "INDEX.md"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    lines: list[str] = [
+        f"# {out_root.name} — sagent index",
+        "",
+        f"_last updated: {now} · {len(projects)} project(s) · {len(scratchpads)} scratchpad(s)_",
+        "",
+    ]
+    if projects:
+        lines.append("## Projects")
+        lines.append("")
+        # newest activity first
+        projects.sort(
+            key=lambda p: str(p.get("last_updated", "")), reverse=True
+        )
+        for p in projects:
+            name = p.get("project", p["_dir"])
+            link = f"[[{p['_dir']}/project|{name}]]"
+            count = p.get("session_count", "?")
+            recent = p.get("sessions_last_7d", 0)
+            recent_str = f", {recent} this week" if recent else ""
+            tag = p.get("tagline", "")
+            desc = p.get("description", "")
+            lines.append(f"### {link}")
+            if desc:
+                lines.append(f"_{desc}_")
+            if tag:
+                lines.append(f"**now:** {tag}")
+            stats_bits = [f"{count} sessions{recent_str}"]
+            for fld, label in (
+                ("decisions", "decisions"),
+                ("open_threads", "open"),
+                ("risks", "risks"),
+            ):
+                v = p.get(fld, 0) or 0
+                if v:
+                    stats_bits.append(f"{v} {label}")
+            lines.append("`" + " · ".join(stats_bits) + "`")
+            lines.append("")
+    if scratchpads:
+        lines.append("## Scratchpads")
+        lines.append("")
+        scratchpads.sort(
+            key=lambda p: str(p.get("last_updated", "")), reverse=True
+        )
+        for p in scratchpads:
+            name = p.get("project", p["_dir"])
+            link = f"[[{p['_dir']}/recent|{name}]]"
+            count = p.get("session_count_30d", "?")
+            window = p.get("window_days", 30)
+            lines.append(f"- {link} · {count} sessions in last {window}d")
         lines.append("")
 
     out.write_text("\n".join(lines))
@@ -156,12 +260,18 @@ When secrets appear:
 
 PROJECT_BASE_PROMPT = SECRETS_POLICY + """You are maintaining a cumulative project digest from a series of coding sessions. Your output is a single markdown document that a developer reads to catch up on what's been happening on this project across all sessions.
 
-Output ONLY the markdown document. Do not wrap it in code fences. No preamble, no commentary, no "here's the document". Start with the heading.
+Output ONLY the markdown document. Do not wrap it in code fences. No preamble, no commentary, no "here's the document".
 
-Document structure:
+The output MUST start with these two lines, in this exact format:
 
-The first line is the H1: `# <project name>`
-The second line is a one-line italic metadata: session count, last updated date.
+DESCRIPTION: <stable one-or-two-sentence description of what this project IS — what it's for, what it does. Less than 280 characters. Should not change much across sessions; describe the project, not the current state. Plain text, no quotes, no newlines.>
+TAGLINE: <one-line headline about CURRENT STATE — what's actively in flight right now. May change every session. Plain text, no quotes, no newlines.>
+
+Then a blank line, then the H1 and rest of the document.
+
+Document body structure:
+
+The first body line is the H1: `# <project name>`
 Then these sections, in order. Omit any section that would be empty — do not pad:
 
 ## Current state
@@ -220,7 +330,10 @@ async def _run_project_rollup_async(
     model: str,
     rate_limiter: RateLimiter | None = None,
 ) -> str:
-    is_incremental = bool(prior_project_md.strip())
+    # Strip prior front matter before feeding to the LLM — the LLM should
+    # only see the markdown body, and will emit a fresh DESCRIPTION/TAGLINE.
+    prior_body = strip_front_matter(prior_project_md).strip()
+    is_incremental = bool(prior_body)
     system = PROJECT_BASE_PROMPT + (
         PROJECT_INCREMENTAL_SUFFIX if is_incremental else ""
     )
@@ -230,7 +343,7 @@ async def _run_project_rollup_async(
     if is_incremental:
         user = (
             f"Project: `{project_name}`\n\n"
-            f"PRIOR PROJECT.md:\n\n{prior_project_md.strip()}\n\n"
+            f"PRIOR PROJECT.md:\n\n{prior_body}\n\n"
             f"---\n\n"
             f"NEW SESSION DIGEST:\n\n{new_block}"
         )
@@ -327,8 +440,99 @@ def roll_up_project(
             )
         )
 
-    project_md_path.write_text(_strip_code_fence(text).strip() + "\n")
+    body = _strip_code_fence(text).strip()
+    description, tagline, body = _extract_description_tagline(body)
+    fm = _build_project_front_matter(
+        project_dir=project_dir,
+        body=body,
+        description=description,
+        tagline=tagline,
+    )
+    project_md_path.write_text(to_front_matter(fm) + "\n" + body + "\n")
     return project_md_path
+
+
+def _extract_description_tagline(body: str) -> tuple[str, str, str]:
+    """Pull DESCRIPTION: and TAGLINE: lines off the top of the LLM output.
+
+    Returns (description, tagline, remaining_body). Tolerant: if either line
+    is missing, returns "" for it and leaves the body alone for that line.
+    """
+    description = ""
+    tagline = ""
+    lines = body.splitlines()
+    consumed = 0
+    for line in lines:
+        if not line.strip():
+            consumed += 1
+            continue
+        m_desc = re.match(r"^DESCRIPTION:\s*(.*)$", line)
+        m_tag = re.match(r"^TAGLINE:\s*(.*)$", line)
+        if m_desc and not description:
+            description = m_desc.group(1).strip()
+            consumed += 1
+            continue
+        if m_tag and not tagline:
+            tagline = m_tag.group(1).strip()
+            consumed += 1
+            continue
+        break
+    description = cap_description(description, max_chars=280)
+    remaining = "\n".join(lines[consumed:]).lstrip()
+    return description, tagline, remaining
+
+
+def _build_project_front_matter(
+    *,
+    project_dir: Path,
+    body: str,
+    description: str,
+    tagline: str,
+) -> dict:
+    sessions_dir = project_dir / "sessions"
+    session_files = (
+        sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
+    )
+    cutoff = time.time() - 7 * 86_400
+    sessions_last_7d = sum(
+        1 for f in session_files if f.stat().st_mtime >= cutoff
+    )
+
+    counts = _count_section_bullets(body)
+
+    return {
+        "type": "project",
+        "source": "claude-code",
+        "project": project_dir.name.lstrip("-"),
+        "description": description,
+        "tagline": tagline,
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "session_count": len(session_files),
+        "sessions_last_7d": sessions_last_7d,
+        "decisions": counts.get("Long-term decisions", 0)
+        + counts.get("Decisions", 0),
+        "open_threads": counts.get("Open threads", 0),
+        "preferences": counts.get("User preferences", 0)
+        + counts.get("Preferences", 0),
+        "risks": counts.get("Risks & known issues", 0)
+        + counts.get("Risks", 0)
+        + counts.get("Risks & blockers", 0),
+    }
+
+
+def _count_section_bullets(body: str) -> dict[str, int]:
+    """Count `- ` bullets under each `## Section` heading in the body."""
+    counts: dict[str, int] = {}
+    current: str | None = None
+    for line in body.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            current = m.group(1).strip()
+            counts[current] = 0
+            continue
+        if current and line.lstrip().startswith("- "):
+            counts[current] = counts.get(current, 0) + 1
+    return counts
 
 
 def _strip_code_fence(text: str) -> str:
