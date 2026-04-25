@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from .parser import Event, Session
+from .rate import RateLimiter, SagentRateLimitError, is_rate_limit_text
 
 UNDERSTANDING_BASE = """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
 
@@ -86,7 +87,12 @@ def build_transcript(
     return "\n\n".join(blocks)
 
 
-async def _query_async(system: str, user_message: str, model: str) -> str:
+async def _query_async(
+    system: str,
+    user_message: str,
+    model: str,
+    rate_limiter: RateLimiter | None = None,
+) -> str:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -94,6 +100,9 @@ async def _query_async(system: str, user_message: str, model: str) -> str:
         TextBlock,
         query,
     )
+
+    if rate_limiter is not None:
+        rate_limiter.acquire()
 
     options = ClaudeAgentOptions(
         system_prompt=system,
@@ -105,14 +114,19 @@ async def _query_async(system: str, user_message: str, model: str) -> str:
 
     text = ""
     final_result = ""
-    async for message in query(prompt=user_message, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    text += block.text
-        elif isinstance(message, ResultMessage):
-            if message.result:
-                final_result = message.result
+    try:
+        async for message in query(prompt=user_message, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        text += block.text
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    final_result = message.result
+    except Exception as exc:
+        if is_rate_limit_text(str(exc)):
+            raise SagentRateLimitError(str(exc)) from exc
+        raise
     return text or final_result
 
 
@@ -132,6 +146,7 @@ def run_understanding(
     prior_summary: str = "",
     prior_understanding: str = "",
     since_event_index: int = 0,
+    rate_limiter: RateLimiter | None = None,
 ) -> tuple[str, str]:
     """Returns (summary_md, understanding_md).
 
@@ -161,7 +176,9 @@ def run_understanding(
         system = UNDERSTANDING_BASE
         user_message = f"{header}Transcript:\n\n{transcript}"
 
-    text = asyncio.run(_query_async(system, user_message, model))
+    text = asyncio.run(
+        _query_async(system, user_message, model, rate_limiter=rate_limiter)
+    )
     return _split_output(text)
 
 

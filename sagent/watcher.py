@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .rate import SagentRateLimitError
 from .state import StateStore
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -110,17 +111,27 @@ def watch_all(
     min_bytes: int = 5_000,
     min_delta: int = 0,
     state: StateStore | None = None,
+    rate_limit_cooldown: float = 1800.0,
 ) -> None:
     """Watch every project under root, digesting each session when it settles.
 
     If a `state` is provided, sessions already digested at their current size
     (per the state file) are skipped on startup — no re-digest cost across
     service restarts.
+
+    Real projects are processed before scratchpads each pass so the high-value
+    cumulative digests don't get starved behind thousands of one-off sessions.
+
+    On a SagentRateLimitError from on_change, the loop sleeps
+    `rate_limit_cooldown` seconds and skips updating fired_for_size so the
+    session is retried after the window reopens.
     """
+    from .rollup import is_scratchpad
+
     print(
         f"[sagent] watch-all: {root} "
         f"(skip < {min_bytes} bytes, idle: {quiet_seconds}s, "
-        f"min-delta: {min_delta})"
+        f"min-delta: {min_delta}, rate-limit cooldown: {rate_limit_cooldown}s)"
     )
 
     last_size: dict[Path, int] = {}
@@ -138,10 +149,14 @@ def watch_all(
             time.sleep(interval)
             continue
         now = time.monotonic()
-        for proj in root.iterdir():
-            if not proj.is_dir():
-                continue
-            for sess in proj.glob("*.jsonl"):
+        # Real projects first, scratchpads last
+        projs = [p for p in root.iterdir() if p.is_dir()]
+        projs.sort(key=lambda p: (is_scratchpad(p.name), p.name))
+        rate_limited = False
+        for proj in projs:
+            if rate_limited:
+                break
+            for sess in sorted(proj.glob("*.jsonl")):
                 try:
                     size = sess.stat().st_size
                 except FileNotFoundError:
@@ -165,6 +180,15 @@ def watch_all(
                     try:
                         on_change(sess)
                         fired_for_size[sess] = size
+                    except SagentRateLimitError as exc:
+                        print(
+                            f"[sagent] rate limit hit; sleeping "
+                            f"{rate_limit_cooldown:.0f}s before resuming. "
+                            f"({exc})"
+                        )
+                        time.sleep(rate_limit_cooldown)
+                        rate_limited = True
+                        break
                     except Exception as exc:
                         print(f"[sagent] digest error on {sess}: {exc}")
         time.sleep(interval)

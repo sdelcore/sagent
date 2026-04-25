@@ -16,6 +16,7 @@ import re
 import time
 from pathlib import Path
 
+from .rate import RateLimiter
 from .understand import _query_async  # type: ignore[reportPrivateUsage]
 
 
@@ -207,6 +208,7 @@ async def _run_project_rollup_async(
     prior_project_md: str,
     new_session_md: str,
     model: str,
+    rate_limiter: RateLimiter | None = None,
 ) -> str:
     is_incremental = bool(prior_project_md.strip())
     system = PROJECT_BASE_PROMPT + (
@@ -230,7 +232,7 @@ async def _run_project_rollup_async(
             f"{new_block}"
         )
 
-    return await _query_async(system, user, model)
+    return await _query_async(system, user, model, rate_limiter=rate_limiter)
 
 
 async def _run_project_rebuild_async(
@@ -239,6 +241,7 @@ async def _run_project_rebuild_async(
     session_files: list[Path],
     model: str,
     max_total_chars: int = 80_000,
+    rate_limiter: RateLimiter | None = None,
 ) -> str:
     """Full rebuild from many sessions in chronological order. Used to reset
     paraphrase drift every N roll-ups."""
@@ -261,7 +264,7 @@ async def _run_project_rebuild_async(
         f"(chronological, oldest first):\n"
         + "".join(blocks)
     )
-    return await _query_async(system, user, model)
+    return await _query_async(system, user, model, rate_limiter=rate_limiter)
 
 
 def roll_up_project(
@@ -272,6 +275,7 @@ def roll_up_project(
     force_full: bool = False,
     full_rebuild_every: int = 10,
     rollup_count: int = 0,
+    rate_limiter: RateLimiter | None = None,
 ) -> Path:
     """Update project.md after a new per-session digest landed.
 
@@ -297,6 +301,7 @@ def roll_up_project(
                 project_name=project_name,
                 session_files=all_sessions,
                 model=model,
+                rate_limiter=rate_limiter,
             )
         )
     else:
@@ -308,6 +313,7 @@ def roll_up_project(
                 prior_project_md=prior,
                 new_session_md=new_session_md,
                 model=model,
+                rate_limiter=rate_limiter,
             )
         )
 

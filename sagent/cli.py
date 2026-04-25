@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .digest import build_timeline, write_session_md
 from .parser import load_session
+from .rate import RateLimiter, SagentRateLimitError
 from .rollup import is_scratchpad, roll_up_project, update_recent
 from .state import StateStore, default_state_path
 from .understand import run_understanding
@@ -93,6 +94,7 @@ def _digest_one(
     min_delta: int = 0,
     min_prompts: int = 1,
     skip_rollup: bool = False,
+    rate_limiter: RateLimiter | None = None,
     verbose: bool = True,
 ) -> None:
     try:
@@ -188,6 +190,7 @@ def _digest_one(
                 prior_summary=prior_summary,
                 prior_understanding=prior_understanding,
                 since_event_index=rec.last_event_index,
+                rate_limiter=rate_limiter,
             )
         else:
             if verbose:
@@ -197,7 +200,12 @@ def _digest_one(
                     else "cold start"
                 )
                 print(f"  … full digest ({reason})")
-            summary_md, understanding_md = run_understanding(session, model=model)
+            summary_md, understanding_md = run_understanding(
+                session, model=model, rate_limiter=rate_limiter
+            )
+    except SagentRateLimitError:
+        # Don't mark state — let the next pass retry once cooldown lifts.
+        raise
     except Exception as exc:
         print(f"[sagent] understanding failed for {session_path.name}: {exc}")
         return
@@ -228,8 +236,11 @@ def _digest_one(
             state=state,
             force_full=force_full,
             full_rebuild_every=full_rebuild_every,
+            rate_limiter=rate_limiter,
             verbose=verbose,
         )
+    except SagentRateLimitError:
+        raise
     except Exception as exc:
         print(f"[sagent] roll-up failed for {project_dir.name}: {exc}")
 
@@ -255,6 +266,7 @@ def _maybe_rollup(
     state: StateStore | None,
     force_full: bool,
     full_rebuild_every: int,
+    rate_limiter: RateLimiter | None,
     verbose: bool,
 ) -> None:
     if is_scratchpad(project_dir.name):
@@ -278,6 +290,7 @@ def _maybe_rollup(
         force_full=force_full,
         full_rebuild_every=full_rebuild_every,
         rollup_count=rollup_count,
+        rate_limiter=rate_limiter,
     )
     if state is not None:
         state.mark_rolled_up(project_dir.name, session_id=session_id)
@@ -290,27 +303,39 @@ def _make_state(args: argparse.Namespace) -> StateStore | None:
     return StateStore(Path(args.state) if args.state else None)
 
 
+def _make_rate_limiter(args: argparse.Namespace) -> RateLimiter | None:
+    n = getattr(args, "max_per_hour", 0) or 0
+    return RateLimiter(max_per_hour=n) if n > 0 else None
+
+
 def cmd_digest(args: argparse.Namespace) -> int:
     session_path = _resolve_input(args.target)
     out_root = Path(args.out) if args.out else default_out_dir()
     state = _make_state(args)
-    _digest_one(
-        session_path,
-        out_root,
-        model=args.model,
-        no_llm=args.no_llm,
-        state=state,
-        force_full=args.force_full,
-        full_rebuild_every=args.full_rebuild_every,
-        min_prompts=args.min_prompts,
-        skip_rollup=args.skip_rollup,
-    )
+    rate_limiter = _make_rate_limiter(args)
+    try:
+        _digest_one(
+            session_path,
+            out_root,
+            model=args.model,
+            no_llm=args.no_llm,
+            state=state,
+            force_full=args.force_full,
+            full_rebuild_every=args.full_rebuild_every,
+            min_prompts=args.min_prompts,
+            skip_rollup=args.skip_rollup,
+            rate_limiter=rate_limiter,
+        )
+    except SagentRateLimitError as exc:
+        print(f"[sagent] rate limit hit: {exc}")
+        return 2
     return 0
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
     state = _make_state(args)
+    rate_limiter = _make_rate_limiter(args)
 
     def on_change(path: Path) -> None:
         _digest_one(
@@ -322,6 +347,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
             min_prompts=args.min_prompts,
+            rate_limiter=rate_limiter,
         )
 
     if args.target:
@@ -342,9 +368,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_watch_all(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
     state = _make_state(args)
+    rate_limiter = _make_rate_limiter(args)
     print(f"[sagent] output root: {out_root}")
     if state is not None:
         print(f"[sagent] state: {state.path}")
+    if rate_limiter is not None:
+        print(f"[sagent] rate limit: {args.max_per_hour}/hour")
 
     def on_change(path: Path) -> None:
         _digest_one(
@@ -356,6 +385,7 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
             min_prompts=args.min_prompts,
+            rate_limiter=rate_limiter,
         )
 
     watch_all(
@@ -364,6 +394,7 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
         min_delta=args.min_delta,
         quiet_seconds=args.idle_seconds,
         state=state,
+        rate_limit_cooldown=args.rate_limit_cooldown,
     )
     return 0
 
@@ -371,14 +402,16 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
 def cmd_digest_all(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
     state = _make_state(args)
+    rate_limiter = _make_rate_limiter(args)
     print(f"[sagent] output root: {out_root}")
     if state is not None:
         print(f"[sagent] state: {state.path}")
     count = 0
     skipped = 0
-    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
-        if not proj.is_dir():
-            continue
+    # Real projects first, scratchpads last
+    projs = [p for p in CLAUDE_PROJECTS.iterdir() if p.is_dir()]
+    projs.sort(key=lambda p: (is_scratchpad(p.name), p.name))
+    for proj in projs:
         for sess in sorted(proj.glob("*.jsonl")):
             try:
                 size = sess.stat().st_size
@@ -391,16 +424,21 @@ def cmd_digest_all(args: argparse.Namespace) -> int:
             ):
                 skipped += 1
                 continue
-            _digest_one(
-                sess,
-                out_root,
-                model=args.model,
-                no_llm=args.no_llm,
-                state=state,
-                force_full=args.force_full,
-                full_rebuild_every=args.full_rebuild_every,
-                min_prompts=args.min_prompts,
-            )
+            try:
+                _digest_one(
+                    sess,
+                    out_root,
+                    model=args.model,
+                    no_llm=args.no_llm,
+                    state=state,
+                    force_full=args.force_full,
+                    full_rebuild_every=args.full_rebuild_every,
+                    min_prompts=args.min_prompts,
+                    rate_limiter=rate_limiter,
+                )
+            except SagentRateLimitError as exc:
+                print(f"[sagent] rate limit hit, stopping: {exc}")
+                break
             count += 1
     print(f"[sagent] digested {count}; skipped {skipped} already-digested")
     return 0
@@ -558,6 +596,18 @@ def _add_min_prompts_arg(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_rate_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--max-per-hour",
+        type=int,
+        default=0,
+        help=(
+            "max LLM calls per rolling hour (default: 0 = unlimited). "
+            "Counts every per-session digest AND every project rollup as one call."
+        ),
+    )
+
+
 def _add_state_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--state",
@@ -610,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the project-level project.md / recent.md update",
     )
     _add_min_prompts_arg(pd)
+    _add_rate_args(pd)
     _add_state_args(pd)
     pd.set_defaults(func=cmd_digest)
 
@@ -630,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
         help="skip if file grew less than this many bytes since last digest",
     )
     _add_min_prompts_arg(pda)
+    _add_rate_args(pda)
     _add_state_args(pda)
     pda.set_defaults(func=cmd_digest_all)
 
@@ -645,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         help=f"idle threshold before digesting (default: {DEFAULT_QUIET_SECONDS:.0f}s)",
     )
     _add_min_prompts_arg(pw)
+    _add_rate_args(pw)
     _add_state_args(pw)
     pw.set_defaults(func=cmd_watch)
 
@@ -672,7 +725,17 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_QUIET_SECONDS,
         help=f"idle threshold before digesting (default: {DEFAULT_QUIET_SECONDS:.0f}s)",
     )
+    pwa.add_argument(
+        "--rate-limit-cooldown",
+        type=float,
+        default=1800.0,
+        help=(
+            "seconds to sleep when the API reports rate-limit before "
+            "resuming digests (default: 1800)"
+        ),
+    )
     _add_min_prompts_arg(pwa)
+    _add_rate_args(pwa)
     _add_state_args(pwa)
     pwa.set_defaults(func=cmd_watch_all)
 
