@@ -99,7 +99,7 @@ async def _run_via_sdk_async(system: str, user_message: str, model: str) -> str:
 
 def run_understanding(
     session: Session,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-4-5",
 ) -> tuple[str, str]:
     """Returns (summary_md, understanding_md).
 
@@ -126,7 +126,7 @@ def run_understanding(
 def write_understanding(
     session: Session,
     out_dir: Path,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-4-5",
 ) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary, understanding = run_understanding(session, model=model)

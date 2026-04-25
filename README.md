@@ -79,7 +79,7 @@ commands:
 common flags:
   --out PATH           output root (default: $SAGENT_OUT or
                        ~/Obsidian/sagent/<hostname>/ or ./sagent-out)
-  --model MODEL        model id (default: claude-sonnet-4-6)
+  --model MODEL        model id (default: claude-haiku-4-5)
   --no-llm             rule-based timeline only, no LLM cost
 ```
 

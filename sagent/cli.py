@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sagent", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    common_model = dict(default="claude-sonnet-4-6")
+    common_model = dict(default="claude-haiku-4-5")
     out_help = (
         "output root (default: $SAGENT_OUT or ~/Obsidian/sagent/<hostname>/ "
         "or ./sagent-out)"
