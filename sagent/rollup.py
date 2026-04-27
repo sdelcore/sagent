@@ -477,6 +477,7 @@ def roll_up_project(
         description=description,
         tagline=tagline,
     )
+    body = _inject_headline_block(body, project_name=project_name, fm=fm)
     project_md_path.write_text(to_front_matter(fm) + "\n" + body + "\n")
     return project_md_path
 
@@ -590,6 +591,150 @@ def _momentum_bucket(last_7d: int, prior_7d: int) -> str:
     if last_7d < prior_7d:
         return "cooling"
     return "steady"
+
+
+def _build_headline_block(project_name: str, fm: dict) -> list[str]:
+    """Build the quote + stats lines that mirror frontmatter into the body.
+
+    Returns a list of lines (no trailing blank). Caller decides spacing.
+    Fields not present in `fm` are omitted gracefully so the block still
+    renders before issue #1 (`days_since_last_session` + `momentum`) lands.
+    """
+    description = (fm.get("description") or "").strip()
+    tagline = (fm.get("tagline") or "").strip()
+
+    quote_lines: list[str] = []
+    if description:
+        quote_lines.append(f"> **{project_name}** — {description}")
+    else:
+        quote_lines.append(f"> **{project_name}**")
+    if tagline:
+        quote_lines.append(f"> **Now:** {tagline}")
+
+    stats_bits: list[str] = []
+    for fld, label in (
+        ("decisions", "decisions"),
+        ("open_threads", "open"),
+        ("risks", "risks"),
+    ):
+        v = fm.get(fld)
+        if v:
+            stats_bits.append(f"{v} {label}")
+    days = fm.get("days_since_last_session")
+    if isinstance(days, int) and days >= 0:
+        stats_bits.append(f"last session {days}d ago")
+    momentum = fm.get("momentum")
+    if momentum:
+        stats_bits.append(f"momentum: {momentum}")
+
+    lines = list(quote_lines)
+    if stats_bits:
+        lines.append("")
+        lines.append("`" + " · ".join(stats_bits) + "`")
+    return lines
+
+
+def _inject_headline_block(body: str, *, project_name: str, fm: dict) -> str:
+    """Insert (or replace) the headline block between the H1 and next `##`.
+
+    Idempotent: if a prior injected block is present (quote lines starting
+    with `> **<name>**` or `> **Now:**`, plus an optional inline-code stats
+    line), it's stripped before the fresh block is inserted.
+    """
+    lines = body.splitlines()
+    # Find the H1 line. If the body doesn't start with one, just leave it.
+    h1_idx = -1
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            h1_idx = i
+            break
+        if line.strip():
+            # Non-blank, non-H1 first content — bail out.
+            return body
+    if h1_idx < 0:
+        return body
+
+    # Find the next `## ` heading (or EOF) — that bounds the headline area.
+    next_idx = len(lines)
+    for j in range(h1_idx + 1, len(lines)):
+        if lines[j].startswith("## "):
+            next_idx = j
+            break
+
+    # Strip prior injected headline block from [h1_idx+1, next_idx).
+    middle = lines[h1_idx + 1 : next_idx]
+    middle = _strip_prior_headline_block(middle)
+
+    # Build fresh block.
+    block = _build_headline_block(project_name, fm)
+
+    # Compose: H1, blank, block, blank, then existing middle (cleaned), then rest.
+    new_middle: list[str] = [""]
+    if block:
+        new_middle.extend(block)
+        new_middle.append("")
+    # Re-attach surviving middle content. Trim leading blanks so we don't
+    # double up; a single blank already separates block from what follows.
+    while middle and not middle[0].strip():
+        middle.pop(0)
+    if middle:
+        new_middle.extend(middle)
+        if new_middle[-1].strip():
+            new_middle.append("")
+
+    out = lines[: h1_idx + 1] + new_middle + lines[next_idx:]
+    return "\n".join(out)
+
+
+def _strip_prior_headline_block(middle: list[str]) -> list[str]:
+    """Remove a previously-injected quote+stats block from the H1→## window.
+
+    Detection is shape-based: contiguous `>` quote lines that match the
+    `> **<name>** ...` / `> **Now:** ...` pattern, plus an optional inline-code
+    stats line `\\`...\\`` on its own. Surrounding blanks are also consumed so
+    the caller can re-insert cleanly.
+    """
+    if not middle:
+        return middle
+
+    # Skip leading blanks to find first non-blank content.
+    i = 0
+    while i < len(middle) and not middle[i].strip():
+        i += 1
+
+    # Try to match a quote block of our shape.
+    quote_re = re.compile(r"^>\s+\*\*([^*]+)\*\*")
+    quote_now_re = re.compile(r"^>\s+\*\*Now:\*\*")
+    start = i
+    j = i
+    saw_our_quote = False
+    while j < len(middle) and middle[j].lstrip().startswith(">"):
+        line = middle[j]
+        if quote_re.match(line) or quote_now_re.match(line):
+            saw_our_quote = True
+        j += 1
+
+    if not saw_our_quote:
+        return middle
+
+    # Skip blank line(s) between quote and stats.
+    k = j
+    while k < len(middle) and not middle[k].strip():
+        k += 1
+
+    # Optional stats line: a single `...` inline-code line.
+    if (
+        k < len(middle)
+        and middle[k].lstrip().startswith("`")
+        and middle[k].rstrip().endswith("`")
+    ):
+        k += 1
+
+    # Consume trailing blanks immediately after the block.
+    while k < len(middle) and not middle[k].strip():
+        k += 1
+
+    return middle[:start] + middle[k:]
 
 
 def _count_section_bullets(body: str) -> dict[str, int]:

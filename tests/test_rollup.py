@@ -12,6 +12,7 @@ from sagent.rollup import (
     _extract_description_tagline,
     _extract_gist,
     _first_sentence,
+    _inject_headline_block,
     _momentum_bucket,
     is_scratchpad,
     update_index,
@@ -310,6 +311,114 @@ def test_update_index_renders_momentum_badge(tmp_path: Path):
     assert out is not None
     text = out.read_text()
     assert "momentum: cold" in text
+
+def test_inject_headline_block_inserts_below_h1():
+    body = "# aria\n\n## Current state\nGoing well.\n"
+    fm = {
+        "description": "Pushes Claude Code transcripts into Obsidian.",
+        "tagline": "wiring up project.md headline injection",
+        "decisions": 3,
+        "open_threads": 2,
+        "risks": 1,
+    }
+    out = _inject_headline_block(body, project_name="aria", fm=fm)
+    lines = out.splitlines()
+    # H1 still first
+    assert lines[0] == "# aria"
+    # Headline block sits before Current state
+    assert "> **aria** — Pushes Claude Code transcripts into Obsidian." in out
+    assert "> **Now:** wiring up project.md headline injection" in out
+    assert "`3 decisions · 2 open · 1 risks`" in out
+    # The injected block is above Current state
+    assert out.index("> **aria**") < out.index("## Current state")
+    # Trailing blank line before ## Current state preserved
+    assert "\n\n## Current state" in out
+
+
+def test_inject_headline_block_idempotent():
+    body = "# aria\n\n## Current state\nGoing well.\n"
+    fm = {
+        "description": "A project.",
+        "tagline": "moving",
+        "decisions": 2,
+        "open_threads": 0,
+        "risks": 0,
+    }
+    once = _inject_headline_block(body, project_name="aria", fm=fm)
+    twice = _inject_headline_block(once, project_name="aria", fm=fm)
+    assert once == twice
+    # And no duplicated quote lines
+    assert once.count("> **aria** — A project.") == 1
+    assert once.count("> **Now:** moving") == 1
+
+
+def test_inject_headline_block_replaces_prior_block_with_new_data():
+    # First inject with old data
+    body = "# aria\n\n## Current state\nx\n"
+    fm_old = {"description": "old desc", "tagline": "old tag", "decisions": 1}
+    after_old = _inject_headline_block(body, project_name="aria", fm=fm_old)
+    fm_new = {
+        "description": "new desc",
+        "tagline": "new tag",
+        "decisions": 5,
+        "open_threads": 1,
+    }
+    after_new = _inject_headline_block(after_old, project_name="aria", fm=fm_new)
+    # Old strings gone, new strings present, no duplicate quote lines
+    assert "old desc" not in after_new
+    assert "old tag" not in after_new
+    assert "new desc" in after_new
+    assert "new tag" in after_new
+    assert after_new.count("> **aria**") == 1
+    assert "`5 decisions · 1 open`" in after_new
+
+
+def test_inject_headline_block_omits_missing_stats_cleanly():
+    # No counts set, no momentum, no days_since_last_session — issue #1 fields absent
+    body = "# aria\n\n## Current state\nx\n"
+    fm = {"description": "desc only", "tagline": "tag only"}
+    out = _inject_headline_block(body, project_name="aria", fm=fm)
+    assert "> **aria** — desc only" in out
+    assert "> **Now:** tag only" in out
+    # No stats line at all because every field is missing/zero
+    assert "`" not in out
+    assert "momentum" not in out
+    assert "last session" not in out
+
+
+def test_inject_headline_block_includes_momentum_and_days_when_present():
+    body = "# aria\n\n## Current state\nx\n"
+    fm = {
+        "description": "desc",
+        "tagline": "tag",
+        "decisions": 4,
+        "open_threads": 2,
+        "risks": 1,
+        "days_since_last_session": 3,
+        "momentum": "hot",
+    }
+    out = _inject_headline_block(body, project_name="aria", fm=fm)
+    assert (
+        "`4 decisions · 2 open · 1 risks · last session 3d ago · momentum: hot`"
+        in out
+    )
+
+
+def test_inject_headline_block_omits_missing_description_or_tagline():
+    body = "# aria\n\n## Current state\nx\n"
+    fm = {"decisions": 2}
+    out = _inject_headline_block(body, project_name="aria", fm=fm)
+    # Quote is project name only (no em dash + desc)
+    assert "> **aria**\n" in out
+    # No "Now:" line because tagline is empty
+    assert "> **Now:**" not in out
+    assert "`2 decisions`" in out
+
+
+def test_inject_headline_block_no_h1_returns_body_unchanged():
+    body = "no heading here\nsome text\n"
+    out = _inject_headline_block(body, project_name="aria", fm={"description": "x"})
+    assert out == body
 
 
 def test_update_index_lists_projects_and_scratchpads(tmp_path: Path):
