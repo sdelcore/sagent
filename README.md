@@ -511,6 +511,14 @@ sagent/
 
 ## Releases
 
+- **1.0** — first stable. Incorporates 0.11's project source context
+  reading: rollups now ground their description in the actual project
+  directory (README, manifests, CLAUDE.md, top-level listing) rather
+  than transcript paraphrase alone. Verified running on nightman and
+  dayman.
+- **0.11** — `project_context.py` reads top-level anchor files from
+  the project's cwd and feeds them to the rollup LLM as
+  `PROJECT SOURCE CONTEXT`.
 - **0.10** — YAML front matter on every output, INDEX.md per host,
   Timeline section dropped from session files (use `source_jsonl`).
 - **0.9** — transcript filtering before LLM call (drop thinking,

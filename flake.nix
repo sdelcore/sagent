@@ -29,7 +29,7 @@
 
         sagent = python.pkgs.buildPythonApplication {
           pname = "sagent";
-          version = "0.11.0";
+          version = "1.0.0";
           src = ./.;
           pyproject = true;
           nativeBuildInputs = with python.pkgs; [ hatchling ];
