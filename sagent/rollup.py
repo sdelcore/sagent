@@ -22,6 +22,7 @@ from .frontmatter import (
     strip_front_matter,
     to_front_matter,
 )
+from .project_context import read_project_context
 from .rate import RateLimiter
 from .understand import _query_async  # type: ignore[reportPrivateUsage]
 
@@ -260,6 +261,8 @@ When secrets appear:
 
 PROJECT_BASE_PROMPT = SECRETS_POLICY + """You are maintaining a cumulative project digest from a series of coding sessions. Your output is a single markdown document that a developer reads to catch up on what's been happening on this project across all sessions.
 
+The user message may include a "PROJECT SOURCE CONTEXT" section that quotes the current state of files on disk (README, manifests, top-level entries, CLAUDE.md, etc.). This is authoritative for what the project IS — its purpose, tech stack, structure. The session transcripts are historical and may be out of date with what's on disk now. When deriving the description and "Current state" prose, prefer the source context for what the project IS; prefer the transcripts for what's been happening recently.
+
 Output ONLY the markdown document. Do not wrap it in code fences. No preamble, no commentary, no "here's the document".
 
 The output MUST start with these two lines, in this exact format:
@@ -327,6 +330,7 @@ async def _run_project_rollup_async(
     project_name: str,
     prior_project_md: str,
     new_session_md: str,
+    project_context_md: str,
     model: str,
     rate_limiter: RateLimiter | None = None,
 ) -> str:
@@ -340,9 +344,17 @@ async def _run_project_rollup_async(
 
     new_block = _build_session_block(new_session_md)
 
+    ctx_section = (
+        f"PROJECT SOURCE CONTEXT (current state of disk; authoritative for "
+        f"what the project IS):\n\n{project_context_md}\n\n---\n\n"
+        if project_context_md.strip()
+        else ""
+    )
+
     if is_incremental:
         user = (
             f"Project: `{project_name}`\n\n"
+            f"{ctx_section}"
             f"PRIOR PROJECT.md:\n\n{prior_body}\n\n"
             f"---\n\n"
             f"NEW SESSION DIGEST:\n\n{new_block}"
@@ -362,6 +374,7 @@ async def _run_project_rebuild_async(
     *,
     project_name: str,
     session_files: list[Path],
+    project_context_md: str,
     model: str,
     max_total_chars: int = 80_000,
     rate_limiter: RateLimiter | None = None,
@@ -380,9 +393,17 @@ async def _run_project_rebuild_async(
         blocks.append(head + b)
         total += len(b) + len(head)
 
+    ctx_section = (
+        f"PROJECT SOURCE CONTEXT (current state of disk; authoritative for "
+        f"what the project IS):\n\n{project_context_md}\n\n---\n\n"
+        if project_context_md.strip()
+        else ""
+    )
+
     system = PROJECT_BASE_PROMPT
     user = (
         f"Project: `{project_name}`\n\n"
+        f"{ctx_section}"
         f"Rebuild project.md from scratch using these session digests "
         f"(chronological, oldest first):\n"
         + "".join(blocks)
@@ -394,6 +415,7 @@ def roll_up_project(
     project_dir: Path,
     *,
     new_session_path: Path,
+    project_source_path: Path | None = None,
     model: str = "claude-haiku-4-5",
     force_full: bool = False,
     full_rebuild_every: int = 10,
@@ -417,12 +439,15 @@ def roll_up_project(
         and (rollup_count + 1) % full_rebuild_every == 0
     )
 
+    project_context_md = read_project_context(project_source_path)
+
     if do_full_rebuild and sessions_dir.exists():
         all_sessions = sorted(sessions_dir.glob("*.md"))
         text = asyncio.run(
             _run_project_rebuild_async(
                 project_name=project_name,
                 session_files=all_sessions,
+                project_context_md=project_context_md,
                 model=model,
                 rate_limiter=rate_limiter,
             )
@@ -435,6 +460,7 @@ def roll_up_project(
                 project_name=project_name,
                 prior_project_md=prior,
                 new_session_md=new_session_md,
+                project_context_md=project_context_md,
                 model=model,
                 rate_limiter=rate_limiter,
             )

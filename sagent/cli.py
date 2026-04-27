@@ -250,6 +250,7 @@ def _digest_one(
             project_dir=project_dir,
             new_session_path=out_path,
             session_id=session.session_id,
+            project_source_path=Path(session.cwd) if session.cwd else None,
             model=model,
             state=state,
             force_full=force_full,
@@ -280,6 +281,7 @@ def _maybe_rollup(
     project_dir: Path,
     new_session_path: Path,
     session_id: str,
+    project_source_path: Path | None,
     model: str,
     state: StateStore | None,
     force_full: bool,
@@ -301,10 +303,16 @@ def _maybe_rollup(
             rollup_count = prec.rollup_count
 
     if verbose:
-        print(f"  … rolling up {project_dir.name}/project.md")
+        ctx_note = (
+            f" (with source from {project_source_path})"
+            if project_source_path and Path(project_source_path).exists()
+            else ""
+        )
+        print(f"  … rolling up {project_dir.name}/project.md{ctx_note}")
     roll_up_project(
         project_dir,
         new_session_path=new_session_path,
+        project_source_path=project_source_path,
         model=model,
         force_full=force_full,
         full_rebuild_every=full_rebuild_every,
@@ -496,10 +504,17 @@ def cmd_rollup(args: argparse.Namespace) -> int:
             prec = state.get_project(project_dir.name)
             if prec:
                 rollup_count = prec.rollup_count
+        # Pull cwd from the latest session's front matter for source context
+        from .frontmatter import split_front_matter
+
+        fm, _ = split_front_matter(latest.read_text(errors="ignore"))
+        cwd = fm.get("cwd")
+        project_source_path = Path(cwd) if cwd else None
         print(f"[sagent] {project_dir.name} → project.md (force_full={args.force_full})")
         roll_up_project(
             project_dir,
             new_session_path=latest,
+            project_source_path=project_source_path,
             model=args.model,
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
