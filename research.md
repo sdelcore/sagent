@@ -628,61 +628,141 @@ honest answer is probably: don't. Write better CLAUDE.md files, use
 
 ## 9. What `sagent` actually is, as built
 
-The MVP landed as a **read-only session observer**, not an injector. See
-`README.md` for usage and `nix/home-manager/sagent.nix` (via the infra
-repo) for the deployment module.
+The MVP landed as a **read-only session observer**, not an injector.
+See `README.md` for the user-facing reference. This section tracks
+what's actually shipped versus the design space above.
 
-**Shipped (v0.2.0):**
+### Shipped (v0.10, current)
 
-- JSONL parser (`sagent/parser.py`) normalizing Claude Code session
-  records into an Event stream.
-- Rule-based `timeline.md` (`sagent/digest.py`): chronology, tool
-  inventory, files touched. Zero LLM cost.
-- LLM-based `summary.md` + `understanding.md` (`sagent/understand.py`):
-  running prose digest plus decisions, open threads, ideas, user
-  preferences, and risks. Defaults to `claude-sonnet-4-6` via the Claude
-  Agent SDK, which transparently handles API-key, OAuth-token, and
-  `~/.claude/` login-state auth — so subscription hosts need zero key
-  setup.
-- File-polling watcher with quiet-period debounce (`sagent/watcher.py`).
-  `watch-all` follows every project in `~/.claude/projects/` at once.
-- CLI (`sagent/cli.py`): `digest`, `digest-all`, `watch`, `watch-all`,
-  `list`.
-- Default output: `~/Obsidian/sagent/<hostname>/<project>/<session>/*.md`,
-  overridable via `$SAGENT_OUT` or `--out`.
-- Nix flake with `packages.default`, `apps.default`, `devShells.default`.
-- Home-manager module with `services.sagent.enable`, systemd user
-  service, optional `apiKeyFile` for opnix-style raw key secrets.
-- 27 tests covering parser, digest, watcher, and CLI helpers.
+**Core pipeline.**
 
-**Not built, deliberately.** The "shadow writer" framing in §3.3 talks
-about a spectrum from passive cataloging up to transcript rewriting and
-API-proxy context replacement. sagent stops at passive cataloging
-(level 1). None of these are implemented:
+- JSONL parser (`sagent/parser.py`) normalizes Claude Code session
+  records into a generic `Event` stream (`user_prompt`,
+  `assistant_text`, `assistant_thinking`, `tool_use`, `tool_result`,
+  `system`).
+- Rule-based timeline rendering (`sagent/digest.py`) — composed into
+  the per-session file, but the chronology section was dropped in
+  v0.10; agents follow `source_jsonl` in front matter for forensics.
+- LLM-based Summary + Understanding (`sagent/understand.py`) via the
+  Claude Agent SDK. Authenticates transparently via
+  `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, or existing
+  `~/.claude/` OAuth — so subscription hosts need zero key setup.
+- Project-level rollup and scratchpad recent.md (`sagent/rollup.py`).
+  Auto-detects project type (`-<user>`, `-tmp` ⇒ scratchpad; else
+  project) and dispatches accordingly. Scratchpad recent.md is text
+  generation only — no LLM cost.
+- INDEX.md per host (in `rollup.py`), regenerated after every rollup.
+  Reads only YAML front matter from each project's `project.md` /
+  `recent.md` and produces a single-page fleet view.
+- File-polling watcher with idle-settle (`sagent/watcher.py`).
+  Default 5-min idle threshold so we summarize completed turns, not
+  in-flight typing.
 
-- Injection into the primary agent's context (§3.3 levels 3–6).
-- Memory-file curation — no writes under `~/.claude/`.
-- Pre-compaction augmentation hooks.
-- Cross-session consolidation.
-- Opencode / Cursor / Codex integration.
+**Reliability and economics.**
 
-The case against building further (§7) still applies to each subsequent
-stage. Revisit only if the level-1 digests turn out to be materially
-useful in practice — and only then, advance one level at a time.
+- Persistent state (`sagent/state.py`) at
+  `$XDG_STATE_HOME/sagent/state.json`. Tracks per-session
+  `last_digested_size`, `last_event_index`, `digest_count`, and
+  per-project `rollup_count`, `last_rolled_up_session_id`. Survives
+  service restarts; no re-digest cost.
+- Incremental summarization. When a session has grown since the last
+  digest, the LLM gets the prior `summary.md` + `understanding.md`
+  and only the new events (`events[last_event_index:]`). Periodic
+  full rebuild every Nth digest (`--full-rebuild-every`, default 10)
+  resets paraphrase drift.
+- Rate limiting (`sagent/rate.py`). Reactive: detects rate-limit
+  signatures from the SDK and raises `SagentRateLimitError`; watcher
+  sleeps `--rate-limit-cooldown` and retries on next pass without
+  marking state. Proactive: `--max-per-hour N` sliding-window cap.
+- Self-generated session detection. v0.7 added
+  `extra_args={"no-session-persistence": None}` so the Agent SDK
+  doesn't write our own LLM calls back into `~/.claude/projects/`,
+  and `Session.is_sagent_self_generated` skips legacy artifacts.
+  `sagent purge-self` deletes them.
+- Transcript filtering before the LLM call (v0.9): drops
+  `assistant_thinking`, successful `tool_result`, system events;
+  collapses `tool_use` inputs to brief signatures; strips Claude
+  Code's auto-injected wrappers from user prompts.
+- Secrets policy in prompts (v0.8): both digest prompts lead with a
+  block telling the LLM that any credentials in the source have been
+  rotated and to acknowledge exposures without echoing literal
+  values. Stops the LLM from refusing to summarize.
 
-**Future stages, if they're ever justified:**
+**Output.**
 
-1. *Memory curation.* Let sagent own writes to `~/.claude/memory/`.
-   Remove the primary agent's self-curation block from `CLAUDE.md`.
-2. *Per-turn injection.* Add a `UserPromptSubmit` hook that reads the
-   top-N catalog entries relevant to the user's prompt and emits them
-   as `additionalContext`.
-3. *Pre-compaction augmentation.* Hook `PreCompact` (Claude Code) or
-   `experimental.session.compacting` (opencode) to inject the running
-   digest into the harness's compaction prompt.
-4. *Harness-agnostic core.* Extract the digest/extract/recall pipeline
-   into a library so the same engine drives Claude Code hooks, opencode
-   plugins, and an API-proxy mode.
+- Default `~/Obsidian/sagent/<hostname>/`, overridable via
+  `$SAGENT_OUT` or `--out`.
+- YAML front matter on every file (`sagent/frontmatter.py`):
+  `description` (capped 280 chars), `tagline`, counts, dates,
+  `source: "claude-code"`. Designed so a downstream agent can
+  triage many projects without loading bodies.
+- Per-session combined `<date>-<id8>.md`: Summary + Understanding
+  only.
+- `project.md` cumulative digest with sections: Current state,
+  Recent activity, Long-term decisions, Open threads, User
+  preferences, Risks & known issues. Description and tagline are
+  emitted by the LLM as `DESCRIPTION:` / `TAGLINE:` leading lines,
+  parsed off, capped, and lifted into front matter.
+
+**Packaging and deploy.**
+
+- Nix flake with `packages.default`, `apps.default`,
+  `devShells.default`. claude-agent-sdk is packaged in-flake via
+  `fetchPypi` (not in nixpkgs as of writing).
+- Home-manager module (in the maintainer's infra repo, mirrored as
+  an example in README): `services.sagent.{enable, model, maxPerHour,
+  rateLimitCooldown, apiKeyFile, outDir, extraArgs}`. Wraps the
+  binary in a systemd user service. Verified deployable via
+  `nixos-rebuild switch --target-host` to remote hosts.
+- 89 tests covering parser, digest, understand, rollup, watcher,
+  state, rate, frontmatter, and CLI helpers.
+
+### Not built
+
+- **Injection into the primary agent's context** (§3.3 levels 3–6).
+  No `UserPromptSubmit` hook, no `PreCompact` augmentation, no MCP
+  tool exposing `scribe_recall`. sagent never writes anything back
+  to the primary's prompt.
+- **Memory-file curation.** No writes under `~/.claude/`. The
+  `purge-self` command is the one exception, and it only deletes
+  files matching sagent's own prompt headers.
+- **Cross-session/cross-project consolidation beyond INDEX.md.** No
+  meta-rollup that synthesizes "what's happening across all my
+  projects this week."
+- **Multi-source.** Only Claude Code today. Architecture allows
+  plugin-style adapters per agent (the parser is the only
+  agent-specific piece; everything above is generic), but the
+  source-package refactor and OpenCode/Cursor/etc. adapters are
+  unbuilt. `source: "claude-code"` in front matter is the only
+  forward-compat marker.
+
+The case against building further (§7) still applies to each
+subsequent stage. Revisit only if the level-1 digests turn out to be
+materially useful in practice — and only then, advance one level at
+a time.
+
+### Useful extensions, in roughly decreasing priority
+
+1. **Multi-source plugin architecture.** Refactor the parser into a
+   `sources/` package (one module per agent) behind a common
+   `Source` protocol. Add OpenCode and other agents as needed. The
+   CLI/watcher/state plumbing already accepts this with minor
+   changes; namespace output by `<source>/<project>/`.
+2. **Cross-project meta-digest.** A weekly "across all projects on
+   nightman, here's what's in flight" rollup. Reads INDEX.md plus
+   each project's `tagline` + `open_threads` + `risks`.
+3. **Memory curation.** Let sagent own a `~/.claude/memory/` write
+   path, replacing the primary agent's self-curation. Requires
+   coordination with Claude Code's auto-memory feature.
+4. **Per-turn injection.** A `UserPromptSubmit` hook that reads the
+   top-N relevant project digests (BM25 over front matter, or
+   embedding lookup) and emits them as `additionalContext`.
+5. **Pre-compaction augmentation.** Hook `PreCompact` (Claude Code)
+   or `experimental.session.compacting` (opencode) to inject the
+   running digest into the harness's compaction prompt.
+6. **Harness-agnostic core CLI.** Already mostly true above the
+   parser; would need cleaner separation of source vs sink and a
+   more explicit plugin API.
 
 ---
 
