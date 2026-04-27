@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import getpass
+import os
+import time
 from pathlib import Path
 
 from sagent.rollup import (
+    _build_project_front_matter,
     _count_section_bullets,
+    _days_since_last_session,
     _extract_description_tagline,
     _extract_gist,
     _first_sentence,
+    _momentum_bucket,
     is_scratchpad,
     update_index,
     update_recent,
@@ -154,6 +159,157 @@ def test_count_section_bullets():
     assert counts["Long-term decisions"] == 3
     assert counts["Open threads"] == 1
     assert counts["Risks & known issues"] == 0
+
+
+def _make_session(sessions_dir: Path, name: str, mtime: float) -> Path:
+    """Create a fake session file with a specific mtime."""
+    p = sessions_dir / name
+    p.write_text("## Summary\n\nFake.\n")
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_momentum_bucket_cold_when_no_recent_activity():
+    assert _momentum_bucket(0, 0) == "cold"
+    # cold dominates regardless of the prior window
+    assert _momentum_bucket(0, 5) == "cold"
+
+
+def test_momentum_bucket_cooling():
+    assert _momentum_bucket(2, 5) == "cooling"
+    assert _momentum_bucket(1, 2) == "cooling"
+
+
+def test_momentum_bucket_steady():
+    assert _momentum_bucket(3, 3) == "steady"
+    assert _momentum_bucket(1, 1) == "steady"
+
+
+def test_momentum_bucket_rising():
+    assert _momentum_bucket(5, 2) == "rising"
+    assert _momentum_bucket(1, 0) == "rising"
+
+
+def test_days_since_last_session_empty():
+    assert _days_since_last_session([], now=time.time()) is None
+
+
+def test_days_since_last_session_basic(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    f1 = _make_session(sessions, "2026-04-20-aaaaaaaa.md", now - 5 * 86_400)
+    f2 = _make_session(sessions, "2026-04-23-bbbbbbbb.md", now - 2 * 86_400)
+    # Newest is f2 → 2 whole days since
+    assert _days_since_last_session([f1, f2], now=now) == 2
+
+
+def test_days_since_last_session_just_now_is_zero(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    f = _make_session(sessions, "2026-04-25-cccccccc.md", now - 60)
+    assert _days_since_last_session([f], now=now) == 0
+
+
+def test_build_project_front_matter_cold_when_empty(tmp_path: Path):
+    fm = _build_project_front_matter(
+        project_dir=tmp_path, body="", description="d", tagline="t"
+    )
+    assert fm["session_count"] == 0
+    assert fm["sessions_last_7d"] == 0
+    assert fm["days_since_last_session"] is None
+    assert fm["momentum"] == "cold"
+
+
+def test_build_project_front_matter_rising(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    # 3 sessions in last 7d, 1 in the prior 7d → rising
+    _make_session(sessions, "2026-04-22-aaaaaaaa.md", now - 1 * 86_400)
+    _make_session(sessions, "2026-04-22-bbbbbbbb.md", now - 3 * 86_400)
+    _make_session(sessions, "2026-04-22-cccccccc.md", now - 6 * 86_400)
+    _make_session(sessions, "2026-04-15-dddddddd.md", now - 10 * 86_400)
+    fm = _build_project_front_matter(
+        project_dir=tmp_path, body="", description="d", tagline="t"
+    )
+    assert fm["sessions_last_7d"] == 3
+    assert fm["momentum"] == "rising"
+    assert fm["days_since_last_session"] == 1
+
+
+def test_build_project_front_matter_steady(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    # 2 in last 7d, 2 in prior 7d → steady
+    _make_session(sessions, "s1.md", now - 1 * 86_400)
+    _make_session(sessions, "s2.md", now - 4 * 86_400)
+    _make_session(sessions, "s3.md", now - 9 * 86_400)
+    _make_session(sessions, "s4.md", now - 12 * 86_400)
+    fm = _build_project_front_matter(
+        project_dir=tmp_path, body="", description="d", tagline="t"
+    )
+    assert fm["sessions_last_7d"] == 2
+    assert fm["momentum"] == "steady"
+
+
+def test_build_project_front_matter_cooling(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    # 1 in last 7d, 3 in prior 7d → cooling
+    _make_session(sessions, "s1.md", now - 2 * 86_400)
+    _make_session(sessions, "s2.md", now - 8 * 86_400)
+    _make_session(sessions, "s3.md", now - 10 * 86_400)
+    _make_session(sessions, "s4.md", now - 13 * 86_400)
+    fm = _build_project_front_matter(
+        project_dir=tmp_path, body="", description="d", tagline="t"
+    )
+    assert fm["sessions_last_7d"] == 1
+    assert fm["momentum"] == "cooling"
+
+
+def test_build_project_front_matter_cold_with_old_sessions(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    # 0 in last 7d, but old sessions exist → cold
+    _make_session(sessions, "s1.md", now - 30 * 86_400)
+    _make_session(sessions, "s2.md", now - 45 * 86_400)
+    fm = _build_project_front_matter(
+        project_dir=tmp_path, body="", description="d", tagline="t"
+    )
+    assert fm["sessions_last_7d"] == 0
+    assert fm["momentum"] == "cold"
+    assert fm["days_since_last_session"] == 30
+
+
+def test_update_index_renders_momentum_badge(tmp_path: Path):
+    proj = tmp_path / "src-bar"
+    proj.mkdir()
+    (proj / "project.md").write_text(
+        '---\n'
+        'type: "project"\n'
+        'project: "src-bar"\n'
+        'description: "Bar project"\n'
+        'tagline: "going"\n'
+        'session_count: 6\n'
+        'sessions_last_7d: 0\n'
+        'days_since_last_session: 12\n'
+        'momentum: "cold"\n'
+        'decisions: 6\n'
+        'open_threads: 9\n'
+        'risks: 0\n'
+        'last_updated: "2026-04-25T10:00:00Z"\n'
+        '---\n'
+        '# src-bar\n'
+    )
+    out = update_index(tmp_path)
+    assert out is not None
+    text = out.read_text()
+    assert "momentum: cold" in text
 
 
 def test_update_index_lists_projects_and_scratchpads(tmp_path: Path):

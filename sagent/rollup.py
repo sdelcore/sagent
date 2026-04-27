@@ -215,6 +215,9 @@ def update_index(out_root: Path) -> Path | None:
                 v = p.get(fld, 0) or 0
                 if v:
                     stats_bits.append(f"{v} {label}")
+            momentum = p.get("momentum")
+            if momentum:
+                stats_bits.append(f"momentum: {momentum}")
             lines.append("`" + " · ".join(stats_bits) + "`")
             lines.append("")
     if scratchpads:
@@ -519,14 +522,21 @@ def _build_project_front_matter(
     session_files = (
         sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
     )
-    cutoff = time.time() - 7 * 86_400
+    now = time.time()
+    cutoff_7d = now - 7 * 86_400
+    cutoff_14d = now - 14 * 86_400
     sessions_last_7d = sum(
-        1 for f in session_files if f.stat().st_mtime >= cutoff
+        1 for f in session_files if f.stat().st_mtime >= cutoff_7d
+    )
+    sessions_prior_7d = sum(
+        1
+        for f in session_files
+        if cutoff_14d <= f.stat().st_mtime < cutoff_7d
     )
 
     counts = _count_section_bullets(body)
 
-    return {
+    fm: dict = {
         "type": "project",
         "source": "claude-code",
         "project": project_dir.name.lstrip("-"),
@@ -535,6 +545,10 @@ def _build_project_front_matter(
         "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "session_count": len(session_files),
         "sessions_last_7d": sessions_last_7d,
+        "days_since_last_session": _days_since_last_session(
+            session_files, now=now
+        ),
+        "momentum": _momentum_bucket(sessions_last_7d, sessions_prior_7d),
         "decisions": counts.get("Long-term decisions", 0)
         + counts.get("Decisions", 0),
         "open_threads": counts.get("Open threads", 0),
@@ -544,6 +558,38 @@ def _build_project_front_matter(
         + counts.get("Risks", 0)
         + counts.get("Risks & blockers", 0),
     }
+    return fm
+
+
+def _days_since_last_session(
+    session_files: list[Path], *, now: float
+) -> int | None:
+    """Whole days between `now` and the newest session file's mtime.
+
+    Returns None when there are no sessions so the caller can omit/null it.
+    """
+    if not session_files:
+        return None
+    newest = max(f.stat().st_mtime for f in session_files)
+    delta = max(0.0, now - newest)
+    return int(delta // 86_400)
+
+
+def _momentum_bucket(last_7d: int, prior_7d: int) -> str:
+    """Bucket recent activity vs the prior 7d window.
+
+    cold     — 0 sessions in last 7d
+    cooling  — last 7d < prior 7d (and last 7d > 0)
+    steady   — last 7d == prior 7d
+    rising   — last 7d > prior 7d
+    """
+    if last_7d == 0:
+        return "cold"
+    if last_7d > prior_7d:
+        return "rising"
+    if last_7d < prior_7d:
+        return "cooling"
+    return "steady"
 
 
 def _count_section_bullets(body: str) -> dict[str, int]:
