@@ -478,6 +478,15 @@ def roll_up_project(
         tagline=tagline,
     )
     body = _inject_headline_block(body, project_name=project_name, fm=fm)
+
+    # Read the prior front matter BEFORE overwriting project.md so we can
+    # diff numeric counts and append a changelog entry. Pure derivation —
+    # no LLM call.
+    prior_fm, _ = split_front_matter(_read_file(project_md_path))
+    delta_line = _format_changelog_line(prior_fm, fm)
+    if delta_line:
+        _append_changelog_entry(project_dir, delta_line)
+
     project_md_path.write_text(to_front_matter(fm) + "\n" + body + "\n")
     return project_md_path
 
@@ -750,6 +759,96 @@ def _count_section_bullets(body: str) -> dict[str, int]:
         if current and line.lstrip().startswith("- "):
             counts[current] = counts.get(current, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Changelog — per-roll-up delta line, derived from frontmatter counts
+# ---------------------------------------------------------------------------
+
+
+# Field order matters: this is the order they appear in the delta line.
+# Tuples: (frontmatter_key, singular_label, plural_label).
+_CHANGELOG_COUNT_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("decisions", "decision", "decisions"),
+    ("open_threads", "open", "open"),
+    ("preferences", "preference", "preferences"),
+    ("risks", "risk", "risks"),
+)
+
+
+def _format_changelog_line(prior_fm: dict, new_fm: dict) -> str:
+    """Build one changelog line from the diff of `prior_fm` → `new_fm`.
+
+    Returns "" if every numeric field is unchanged (the line is suppressed).
+    Only fields whose count actually changed are listed. Momentum is included
+    only when the bucket transitions to a different value.
+    """
+    parts: list[str] = []
+    for key, singular, plural in _CHANGELOG_COUNT_FIELDS:
+        prior = _as_int(prior_fm.get(key))
+        new = _as_int(new_fm.get(key))
+        diff = new - prior
+        if diff == 0:
+            continue
+        sign = "+" if diff > 0 else "-"
+        label = singular if abs(diff) == 1 else plural
+        parts.append(f"{sign}{abs(diff)} {label}")
+
+    prior_sessions = _as_int(prior_fm.get("sessions_last_7d"))
+    new_sessions = _as_int(new_fm.get("sessions_last_7d"))
+    sessions_changed = prior_sessions != new_sessions
+
+    prior_momentum = prior_fm.get("momentum")
+    new_momentum = new_fm.get("momentum")
+    momentum_changed = (
+        new_momentum is not None
+        and prior_momentum is not None
+        and prior_momentum != new_momentum
+    )
+
+    if not parts and not sessions_changed and not momentum_changed:
+        return ""
+
+    segments: list[str] = []
+    if parts:
+        segments.append(", ".join(parts))
+    if sessions_changed:
+        segments.append(f"sessions_last_7d {prior_sessions}→{new_sessions}")
+    if momentum_changed:
+        segments.append(f"momentum {prior_momentum}→{new_momentum}")
+
+    timestamp = str(new_fm.get("last_updated") or "").strip()
+    if not timestamp:
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return f"- {timestamp} — " + " · ".join(segments)
+
+
+def _as_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _append_changelog_entry(
+    project_dir: Path, line: str, *, max_lines: int = 200
+) -> Path:
+    """Prepend `line` to <project_dir>/changelog.md, capped at `max_lines`."""
+    changelog_path = project_dir / "changelog.md"
+    project_name = project_dir.name.lstrip("-")
+    header = f"# changelog — {project_name}"
+
+    existing = _read_file(changelog_path)
+    existing_entries: list[str] = []
+    for raw in existing.splitlines():
+        if raw.startswith("- "):
+            existing_entries.append(raw)
+
+    entries = [line, *existing_entries][:max_lines]
+
+    text = header + "\n\n" + "\n".join(entries) + "\n"
+    changelog_path.write_text(text)
+    return changelog_path
 
 
 def _strip_code_fence(text: str) -> str:
