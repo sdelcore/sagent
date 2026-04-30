@@ -1,3 +1,27 @@
+"""Persistent record of what's been digested.
+
+The ledger answers two questions for the digest pipeline:
+  - "have I already digested this session at this size?"  (the *skip* check)
+  - "what was its prior event index, so I can run incrementally?"  (the
+    *prior* lookup)
+
+It also tracks per-project rollup count, so the pipeline knows when to
+trigger a periodic full rebuild.
+
+Two interfaces sit on top of the same underlying JSON file:
+
+  - **Claim/commit** — the high-level seam used by the pipeline. Open a
+    `DigestClaim`; if it returns `None`, the work is skippable. Do the
+    work; on success, call `claim.commit(...)` to persist. A claim that
+    is never committed leaves the ledger untouched, so a crash mid-digest
+    causes a re-attempt next pass instead of a silent loss.
+  - **Direct getters/setters** — `mark_digested`, `should_skip`, etc.
+    Used by tools (prune, rollup) that don't fit the claim shape.
+
+`NullLedger` is a no-op adapter with the same surface, so callers never
+branch on `ledger is None`.
+"""
+
 from __future__ import annotations
 
 import json
@@ -35,7 +59,47 @@ class ProjectRecord:
     rollup_count: int = 0
 
 
-class StateStore:
+@dataclass
+class DigestClaim:
+    """A reservation to digest one session.
+
+    Holds the prior `SessionRecord` (if any) so the caller can decide
+    incremental vs. full and access `digest_count`. Call `commit()` after
+    a successful or terminal-drop digest; skip the call to leave state
+    untouched (e.g. on rate-limit or crash).
+    """
+
+    session_path: Path
+    size: int
+    prior: SessionRecord | None
+    _ledger: "DigestLedger"
+
+    def commit(self, *, event_index: int) -> None:
+        self._ledger.mark_digested(
+            self.session_path, size=self.size, event_index=event_index
+        )
+        self._ledger.save()
+
+
+@dataclass
+class RollupClaim:
+    """A reservation to roll up one project's digests.
+
+    `prior_count` is the previous `rollup_count` (used by the pipeline to
+    decide on periodic full rebuilds). Call `commit(session_id=...)` after
+    a successful rollup.
+    """
+
+    project_name: str
+    prior_count: int
+    _ledger: "DigestLedger"
+
+    def commit(self, *, session_id: str) -> None:
+        self._ledger.mark_rolled_up(self.project_name, session_id=session_id)
+        self._ledger.save()
+
+
+class DigestLedger:
     """Persistent per-session and per-project digest state.
 
     Single JSON file, atomic writes via temp-then-rename. One writer (the
@@ -49,6 +113,48 @@ class StateStore:
         self.projects: dict[str, ProjectRecord] = {}
         self._loaded_version = CURRENT_VERSION
         self.load()
+
+    # -----------------------------------------------------------------
+    # High-level claim/commit API
+    # -----------------------------------------------------------------
+
+    def claim(
+        self,
+        session_path: Path | str,
+        *,
+        size: int,
+        min_delta: int = 0,
+        force: bool = False,
+    ) -> DigestClaim | None:
+        """Reserve a digest of `session_path` at `size`.
+
+        Returns None if the session is already digested at >= this size
+        (or the size delta is below `min_delta`). `force=True` always
+        returns a claim, regardless of prior state.
+        """
+        if not force and self.should_skip(
+            session_path, size=size, min_delta=min_delta
+        ):
+            return None
+        return DigestClaim(
+            session_path=Path(session_path),
+            size=size,
+            prior=self.get(session_path),
+            _ledger=self,
+        )
+
+    def claim_rollup(self, project_name: str) -> RollupClaim:
+        """Reserve a rollup pass for `project_name`. Always returns a claim."""
+        prior = self.projects.get(project_name)
+        return RollupClaim(
+            project_name=project_name,
+            prior_count=prior.rollup_count if prior else 0,
+            _ledger=self,
+        )
+
+    # -----------------------------------------------------------------
+    # Persistence
+    # -----------------------------------------------------------------
 
     def load(self) -> None:
         if not self.path.exists():
@@ -102,6 +208,11 @@ class StateStore:
             os.fsync(tmp.fileno())
             tmp_path = Path(tmp.name)
         os.replace(tmp_path, self.path)
+
+    # -----------------------------------------------------------------
+    # Low-level getters/setters (still used by tools that don't fit the
+    # claim shape — prune, rollup-from-cli — and by claims internally)
+    # -----------------------------------------------------------------
 
     def get(self, session_path: Path | str) -> SessionRecord | None:
         return self.sessions.get(str(session_path))
@@ -157,3 +268,26 @@ class StateStore:
         rec.last_rolled_up_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         rec.rollup_count += 1
         return rec
+
+
+class NullLedger(DigestLedger):
+    """Drop-in ledger for `--no-state` runs.
+
+    Inherits the in-memory shape (so `.sessions`/`.projects` exist as empty
+    dicts and the watcher's hydration loop is a no-op) but never reads or
+    writes a file. Claims still work; commits update the in-memory dicts
+    but `save()` is a no-op, so nothing leaks to disk.
+    """
+
+    def __init__(self) -> None:
+        # Skip the parent __init__ entirely — no path, no load.
+        self.path = Path(os.devnull)
+        self.sessions = {}
+        self.projects = {}
+        self._loaded_version = CURRENT_VERSION
+
+    def load(self) -> None:  # pragma: no cover - intentional no-op
+        return
+
+    def save(self) -> None:  # pragma: no cover - intentional no-op
+        return

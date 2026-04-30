@@ -6,25 +6,24 @@ Two modes, auto-detected from the encoded Claude Code project name:
   - "project" — everything else (e.g. -home-<user>-src-<name>). We produce
     `project.md` via incremental LLM roll-up that accumulates decisions,
     open threads, preferences, risks across sessions.
+
+The shape of `project.md` itself — parse, render, headline, front-matter
+derivation, changelog diff — lives in `project_doc.py`. This module owns
+the LLM call, the scratchpad/index outputs, and file I/O.
 """
 
 from __future__ import annotations
 
-import asyncio
 import getpass
 import re
 import time
 from pathlib import Path
 
-from .frontmatter import (
-    cap_description,
-    split_front_matter,
-    strip_front_matter,
-    to_front_matter,
-)
+from .frontmatter import split_front_matter, strip_front_matter, to_front_matter
+from .llm import SECRETS_POLICY, query
 from .project_context import read_project_context
+from .project_doc import ProjectDoc, diff_front_matter
 from .rate import RateLimiter
-from .understand import _query_async  # type: ignore[reportPrivateUsage]
 
 
 def _user() -> str:
@@ -252,16 +251,6 @@ def _extract_gist(session_md: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-SECRETS_POLICY = """SECRETS POLICY
-Any credentials, API keys, passwords, OAuth tokens, certificates, or other secrets that appear in the source material below have already been rotated and are no longer valid. Treat them as historical artifacts. Do not refuse to produce the digest on the grounds that secrets are present, and do not blank out sections because of them.
-
-When secrets appear:
-- Acknowledge the exposure (e.g., "the pfSense password was shared in session X") so the user can verify rotation.
-- Do NOT echo the literal credential value. No tokens, no passwords, no hashes, no `op://...` references that resolve to secret material.
-- Filenames, hostnames, IP addresses, and `op://...` reference paths that don't include the secret value itself are fine to mention.
-
-"""
-
 PROJECT_BASE_PROMPT = SECRETS_POLICY + """You are maintaining a cumulative project digest from a series of coding sessions. Your output is a single markdown document that a developer reads to catch up on what's been happening on this project across all sessions.
 
 The user message may include a "PROJECT SOURCE CONTEXT" section that quotes the current state of files on disk (README, manifests, top-level entries, CLAUDE.md, etc.). This is authoritative for what the project IS — its purpose, tech stack, structure. The session transcripts are historical and may be out of date with what's on disk now. When deriving the description and "Current state" prose, prefer the source context for what the project IS; prefer the transcripts for what's been happening recently.
@@ -328,7 +317,7 @@ def _build_session_block(session_md: str, max_chars: int = 8_000) -> str:
     return text
 
 
-async def _run_project_rollup_async(
+def _run_project_rollup(
     *,
     project_name: str,
     prior_project_md: str,
@@ -370,10 +359,10 @@ async def _run_project_rollup_async(
             f"{new_block}"
         )
 
-    return await _query_async(system, user, model, rate_limiter=rate_limiter)
+    return query(system, user, model, rate_limiter=rate_limiter)
 
 
-async def _run_project_rebuild_async(
+def _run_project_rebuild(
     *,
     project_name: str,
     session_files: list[Path],
@@ -411,7 +400,7 @@ async def _run_project_rebuild_async(
         f"(chronological, oldest first):\n"
         + "".join(blocks)
     )
-    return await _query_async(system, user, model, rate_limiter=rate_limiter)
+    return query(system, user, model, rate_limiter=rate_limiter)
 
 
 def roll_up_project(
@@ -446,44 +435,33 @@ def roll_up_project(
 
     if do_full_rebuild and sessions_dir.exists():
         all_sessions = sorted(sessions_dir.glob("*.md"))
-        text = asyncio.run(
-            _run_project_rebuild_async(
-                project_name=project_name,
-                session_files=all_sessions,
-                project_context_md=project_context_md,
-                model=model,
-                rate_limiter=rate_limiter,
-            )
+        text = _run_project_rebuild(
+            project_name=project_name,
+            session_files=all_sessions,
+            project_context_md=project_context_md,
+            model=model,
+            rate_limiter=rate_limiter,
         )
     else:
         prior = _read_file(project_md_path)
         new_session_md = _read_file(new_session_path)
-        text = asyncio.run(
-            _run_project_rollup_async(
-                project_name=project_name,
-                prior_project_md=prior,
-                new_session_md=new_session_md,
-                project_context_md=project_context_md,
-                model=model,
-                rate_limiter=rate_limiter,
-            )
+        text = _run_project_rollup(
+            project_name=project_name,
+            prior_project_md=prior,
+            new_session_md=new_session_md,
+            project_context_md=project_context_md,
+            model=model,
+            rate_limiter=rate_limiter,
         )
 
-    body = _strip_code_fence(text).strip()
-    description, tagline, body = _extract_description_tagline(body)
-    fm = _build_project_front_matter(
-        project_dir=project_dir,
-        body=body,
-        description=description,
-        tagline=tagline,
-    )
-    body = _inject_headline_block(body, project_name=project_name, fm=fm)
+    doc = ProjectDoc.parse(text, name=project_name)
+    fm = doc.derive_front_matter(sessions_dir=sessions_dir)
+    body = doc.render_body(front_matter=fm)
 
-    # Read the prior front matter BEFORE overwriting project.md so we can
-    # diff numeric counts and append a changelog entry. Pure derivation —
-    # no LLM call.
+    # Read prior front matter BEFORE overwriting so we can diff numeric
+    # counts and append a changelog entry. Pure derivation — no LLM call.
     prior_fm, _ = split_front_matter(_read_file(project_md_path))
-    delta_line = _format_changelog_line(prior_fm, fm)
+    delta_line = diff_front_matter(prior_fm, fm)
     if delta_line:
         _append_changelog_entry(project_dir, delta_line)
 
@@ -491,343 +469,9 @@ def roll_up_project(
     return project_md_path
 
 
-def _extract_description_tagline(body: str) -> tuple[str, str, str]:
-    """Pull DESCRIPTION: and TAGLINE: lines off the top of the LLM output.
-
-    Returns (description, tagline, remaining_body). Tolerant: if either line
-    is missing, returns "" for it and leaves the body alone for that line.
-    """
-    description = ""
-    tagline = ""
-    lines = body.splitlines()
-    consumed = 0
-    for line in lines:
-        if not line.strip():
-            consumed += 1
-            continue
-        m_desc = re.match(r"^DESCRIPTION:\s*(.*)$", line)
-        m_tag = re.match(r"^TAGLINE:\s*(.*)$", line)
-        if m_desc and not description:
-            description = m_desc.group(1).strip()
-            consumed += 1
-            continue
-        if m_tag and not tagline:
-            tagline = m_tag.group(1).strip()
-            consumed += 1
-            continue
-        break
-    description = cap_description(description, max_chars=280)
-    remaining = "\n".join(lines[consumed:]).lstrip()
-    return description, tagline, remaining
-
-
-def _build_project_front_matter(
-    *,
-    project_dir: Path,
-    body: str,
-    description: str,
-    tagline: str,
-) -> dict:
-    sessions_dir = project_dir / "sessions"
-    session_files = (
-        sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
-    )
-    now = time.time()
-    cutoff_7d = now - 7 * 86_400
-    cutoff_14d = now - 14 * 86_400
-    sessions_last_7d = sum(
-        1 for f in session_files if f.stat().st_mtime >= cutoff_7d
-    )
-    sessions_prior_7d = sum(
-        1
-        for f in session_files
-        if cutoff_14d <= f.stat().st_mtime < cutoff_7d
-    )
-
-    counts = _count_section_bullets(body)
-
-    fm: dict = {
-        "type": "project",
-        "source": "claude-code",
-        "project": project_dir.name.lstrip("-"),
-        "description": description,
-        "tagline": tagline,
-        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "session_count": len(session_files),
-        "sessions_last_7d": sessions_last_7d,
-        "days_since_last_session": _days_since_last_session(
-            session_files, now=now
-        ),
-        "momentum": _momentum_bucket(sessions_last_7d, sessions_prior_7d),
-        "decisions": counts.get("Long-term decisions", 0)
-        + counts.get("Decisions", 0),
-        "open_threads": counts.get("Open threads", 0),
-        "preferences": counts.get("User preferences", 0)
-        + counts.get("Preferences", 0),
-        "risks": counts.get("Risks & known issues", 0)
-        + counts.get("Risks", 0)
-        + counts.get("Risks & blockers", 0),
-    }
-    return fm
-
-
-def _days_since_last_session(
-    session_files: list[Path], *, now: float
-) -> int | None:
-    """Whole days between `now` and the newest session file's mtime.
-
-    Returns None when there are no sessions so the caller can omit/null it.
-    """
-    if not session_files:
-        return None
-    newest = max(f.stat().st_mtime for f in session_files)
-    delta = max(0.0, now - newest)
-    return int(delta // 86_400)
-
-
-def _momentum_bucket(last_7d: int, prior_7d: int) -> str:
-    """Bucket recent activity vs the prior 7d window.
-
-    cold     — 0 sessions in last 7d
-    cooling  — last 7d < prior 7d (and last 7d > 0)
-    steady   — last 7d == prior 7d
-    rising   — last 7d > prior 7d
-    """
-    if last_7d == 0:
-        return "cold"
-    if last_7d > prior_7d:
-        return "rising"
-    if last_7d < prior_7d:
-        return "cooling"
-    return "steady"
-
-
-def _build_headline_block(project_name: str, fm: dict) -> list[str]:
-    """Build the quote + stats lines that mirror frontmatter into the body.
-
-    Returns a list of lines (no trailing blank). Caller decides spacing.
-    Fields not present in `fm` are omitted gracefully so the block still
-    renders before issue #1 (`days_since_last_session` + `momentum`) lands.
-    """
-    description = (fm.get("description") or "").strip()
-    tagline = (fm.get("tagline") or "").strip()
-
-    quote_lines: list[str] = []
-    if description:
-        quote_lines.append(f"> **{project_name}** — {description}")
-    else:
-        quote_lines.append(f"> **{project_name}**")
-    if tagline:
-        quote_lines.append(f"> **Now:** {tagline}")
-
-    stats_bits: list[str] = []
-    for fld, label in (
-        ("decisions", "decisions"),
-        ("open_threads", "open"),
-        ("risks", "risks"),
-    ):
-        v = fm.get(fld)
-        if v:
-            stats_bits.append(f"{v} {label}")
-    days = fm.get("days_since_last_session")
-    if isinstance(days, int) and days >= 0:
-        stats_bits.append(f"last session {days}d ago")
-    momentum = fm.get("momentum")
-    if momentum:
-        stats_bits.append(f"momentum: {momentum}")
-
-    lines = list(quote_lines)
-    if stats_bits:
-        lines.append("")
-        lines.append("`" + " · ".join(stats_bits) + "`")
-    return lines
-
-
-def _inject_headline_block(body: str, *, project_name: str, fm: dict) -> str:
-    """Insert (or replace) the headline block between the H1 and next `##`.
-
-    Idempotent: if a prior injected block is present (quote lines starting
-    with `> **<name>**` or `> **Now:**`, plus an optional inline-code stats
-    line), it's stripped before the fresh block is inserted.
-    """
-    lines = body.splitlines()
-    # Find the H1 line. If the body doesn't start with one, just leave it.
-    h1_idx = -1
-    for i, line in enumerate(lines):
-        if line.startswith("# "):
-            h1_idx = i
-            break
-        if line.strip():
-            # Non-blank, non-H1 first content — bail out.
-            return body
-    if h1_idx < 0:
-        return body
-
-    # Find the next `## ` heading (or EOF) — that bounds the headline area.
-    next_idx = len(lines)
-    for j in range(h1_idx + 1, len(lines)):
-        if lines[j].startswith("## "):
-            next_idx = j
-            break
-
-    # Strip prior injected headline block from [h1_idx+1, next_idx).
-    middle = lines[h1_idx + 1 : next_idx]
-    middle = _strip_prior_headline_block(middle)
-
-    # Build fresh block.
-    block = _build_headline_block(project_name, fm)
-
-    # Compose: H1, blank, block, blank, then existing middle (cleaned), then rest.
-    new_middle: list[str] = [""]
-    if block:
-        new_middle.extend(block)
-        new_middle.append("")
-    # Re-attach surviving middle content. Trim leading blanks so we don't
-    # double up; a single blank already separates block from what follows.
-    while middle and not middle[0].strip():
-        middle.pop(0)
-    if middle:
-        new_middle.extend(middle)
-        if new_middle[-1].strip():
-            new_middle.append("")
-
-    out = lines[: h1_idx + 1] + new_middle + lines[next_idx:]
-    return "\n".join(out)
-
-
-def _strip_prior_headline_block(middle: list[str]) -> list[str]:
-    """Remove a previously-injected quote+stats block from the H1→## window.
-
-    Detection is shape-based: contiguous `>` quote lines that match the
-    `> **<name>** ...` / `> **Now:** ...` pattern, plus an optional inline-code
-    stats line `\\`...\\`` on its own. Surrounding blanks are also consumed so
-    the caller can re-insert cleanly.
-    """
-    if not middle:
-        return middle
-
-    # Skip leading blanks to find first non-blank content.
-    i = 0
-    while i < len(middle) and not middle[i].strip():
-        i += 1
-
-    # Try to match a quote block of our shape.
-    quote_re = re.compile(r"^>\s+\*\*([^*]+)\*\*")
-    quote_now_re = re.compile(r"^>\s+\*\*Now:\*\*")
-    start = i
-    j = i
-    saw_our_quote = False
-    while j < len(middle) and middle[j].lstrip().startswith(">"):
-        line = middle[j]
-        if quote_re.match(line) or quote_now_re.match(line):
-            saw_our_quote = True
-        j += 1
-
-    if not saw_our_quote:
-        return middle
-
-    # Skip blank line(s) between quote and stats.
-    k = j
-    while k < len(middle) and not middle[k].strip():
-        k += 1
-
-    # Optional stats line: a single `...` inline-code line.
-    if (
-        k < len(middle)
-        and middle[k].lstrip().startswith("`")
-        and middle[k].rstrip().endswith("`")
-    ):
-        k += 1
-
-    # Consume trailing blanks immediately after the block.
-    while k < len(middle) and not middle[k].strip():
-        k += 1
-
-    return middle[:start] + middle[k:]
-
-
-def _count_section_bullets(body: str) -> dict[str, int]:
-    """Count `- ` bullets under each `## Section` heading in the body."""
-    counts: dict[str, int] = {}
-    current: str | None = None
-    for line in body.splitlines():
-        m = re.match(r"^##\s+(.+?)\s*$", line)
-        if m:
-            current = m.group(1).strip()
-            counts[current] = 0
-            continue
-        if current and line.lstrip().startswith("- "):
-            counts[current] = counts.get(current, 0) + 1
-    return counts
-
-
 # ---------------------------------------------------------------------------
-# Changelog — per-roll-up delta line, derived from frontmatter counts
+# Changelog file I/O — content of each line comes from project_doc.diff_*
 # ---------------------------------------------------------------------------
-
-
-# Field order matters: this is the order they appear in the delta line.
-# Tuples: (frontmatter_key, singular_label, plural_label).
-_CHANGELOG_COUNT_FIELDS: tuple[tuple[str, str, str], ...] = (
-    ("decisions", "decision", "decisions"),
-    ("open_threads", "open", "open"),
-    ("preferences", "preference", "preferences"),
-    ("risks", "risk", "risks"),
-)
-
-
-def _format_changelog_line(prior_fm: dict, new_fm: dict) -> str:
-    """Build one changelog line from the diff of `prior_fm` → `new_fm`.
-
-    Returns "" if every numeric field is unchanged (the line is suppressed).
-    Only fields whose count actually changed are listed. Momentum is included
-    only when the bucket transitions to a different value.
-    """
-    parts: list[str] = []
-    for key, singular, plural in _CHANGELOG_COUNT_FIELDS:
-        prior = _as_int(prior_fm.get(key))
-        new = _as_int(new_fm.get(key))
-        diff = new - prior
-        if diff == 0:
-            continue
-        sign = "+" if diff > 0 else "-"
-        label = singular if abs(diff) == 1 else plural
-        parts.append(f"{sign}{abs(diff)} {label}")
-
-    prior_sessions = _as_int(prior_fm.get("sessions_last_7d"))
-    new_sessions = _as_int(new_fm.get("sessions_last_7d"))
-    sessions_changed = prior_sessions != new_sessions
-
-    prior_momentum = prior_fm.get("momentum")
-    new_momentum = new_fm.get("momentum")
-    momentum_changed = (
-        new_momentum is not None
-        and prior_momentum is not None
-        and prior_momentum != new_momentum
-    )
-
-    if not parts and not sessions_changed and not momentum_changed:
-        return ""
-
-    segments: list[str] = []
-    if parts:
-        segments.append(", ".join(parts))
-    if sessions_changed:
-        segments.append(f"sessions_last_7d {prior_sessions}→{new_sessions}")
-    if momentum_changed:
-        segments.append(f"momentum {prior_momentum}→{new_momentum}")
-
-    timestamp = str(new_fm.get("last_updated") or "").strip()
-    if not timestamp:
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return f"- {timestamp} — " + " · ".join(segments)
-
-
-def _as_int(value) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _append_changelog_entry(
@@ -849,20 +493,3 @@ def _append_changelog_entry(
     text = header + "\n\n" + "\n".join(entries) + "\n"
     changelog_path.write_text(text)
     return changelog_path
-
-
-def _strip_code_fence(text: str) -> str:
-    """Strip a wrapping ```...``` fence if the LLM took the prompt format
-    literally and added one."""
-    t = text.strip()
-    if not t.startswith("```"):
-        return text
-    # remove opening fence (and optional language tag)
-    nl = t.find("\n")
-    if nl < 0:
-        return text
-    body = t[nl + 1 :]
-    # remove closing fence at end if present
-    if body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3]
-    return body
