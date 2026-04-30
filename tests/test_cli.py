@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sagent.cli import _clean_project_name, default_out_dir
+from sagent.cli import default_out_dir
+from sagent.pipeline import clean_project_name
 
 
 def test_clean_project_name_strips_home():
     home = str(Path.home()).replace("/", "-")
     name = f"{home}-src-proj"
-    assert _clean_project_name(name) == "src-proj"
+    assert clean_project_name(name) == "src-proj"
 
 
 def test_clean_project_name_keeps_odd_names():
-    assert _clean_project_name("-tmp") == "tmp"
-    assert _clean_project_name("other") == "other"
+    assert clean_project_name("-tmp") == "tmp"
+    assert clean_project_name("other") == "other"
 
 
 def test_default_out_dir_env(monkeypatch, tmp_path: Path):

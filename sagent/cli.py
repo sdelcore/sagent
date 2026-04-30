@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import socket
 import sys
+from collections import Counter
 from pathlib import Path
 
-from .digest import write_session_md
 from .parser import load_session
+from .pipeline import (
+    DigestConfig,
+    DigestOutcome,
+    clean_project_name,
+    digest_session,
+)
 from .rate import RateLimiter, SagentRateLimitError
-from .rollup import is_scratchpad, roll_up_project, update_index, update_recent
-from .state import StateStore, default_state_path
-from .understand import run_understanding
+from .rollup import is_scratchpad, roll_up_project, update_recent
+from .state import DigestLedger, NullLedger, default_state_path
 from .watcher import (
     CLAUDE_PROJECTS,
     DEFAULT_QUIET_SECONDS,
@@ -35,13 +39,6 @@ def default_out_dir() -> Path:
     if obsidian.is_dir():
         return obsidian / "sagent" / socket.gethostname()
     return Path("sagent-out")
-
-
-def _clean_project_name(dir_name: str) -> str:
-    home = str(Path.home()).replace("/", "-")
-    if dir_name.startswith(home + "-"):
-        return dir_name[len(home) + 1 :]
-    return dir_name.lstrip("-")
 
 
 def _resolve_input(arg: str | None) -> Path:
@@ -67,268 +64,15 @@ def _resolve_input(arg: str | None) -> Path:
     sys.exit(f"could not resolve: {arg}")
 
 
-def _project_dir_for(session_path: Path, base: Path) -> Path:
-    """Output dir for the project this session belongs to."""
-    return base / _clean_project_name(session_path.parent.name)
+def _make_ledger(args: argparse.Namespace) -> DigestLedger:
+    """Build a DigestLedger or a NullLedger when --no-state is set.
 
-
-def _existing_session_md(project_dir: Path, session_id: str) -> Path | None:
-    """Find an existing per-session digest matching this UUID's short id8."""
-    sessions_dir = project_dir / "sessions"
-    if not sessions_dir.exists():
-        return None
-    short = session_id.split("-")[0][:8]
-    matches = list(sessions_dir.glob(f"*-{short}.md"))
-    return matches[0] if matches else None
-
-
-def _digest_one(
-    session_path: Path,
-    out_root: Path,
-    *,
-    model: str,
-    no_llm: bool,
-    state: StateStore | None,
-    force_full: bool = False,
-    full_rebuild_every: int = 10,
-    min_delta: int = 0,
-    min_prompts: int = 1,
-    skip_rollup: bool = False,
-    rate_limiter: RateLimiter | None = None,
-    verbose: bool = True,
-) -> None:
-    try:
-        current_size = session_path.stat().st_size
-    except FileNotFoundError:
-        return
-
-    if (
-        state is not None
-        and not force_full
-        and state.should_skip(session_path, size=current_size, min_delta=min_delta)
-    ):
-        if verbose:
-            print(f"[sagent] {session_path.name} already digested, skipping")
-        return
-
-    session = load_session(session_path)
-    project_dir = _project_dir_for(session_path, out_root)
-
-    # Drop sagent's own LLM-call sessions (created when the Agent SDK
-    # persisted them to ~/.claude/projects). Without this, the watcher
-    # finds them and digests its own prompts, recursing.
-    if session.is_sagent_self_generated:
-        if verbose:
-            print(
-                f"[sagent] {session_path.name} is sagent-self-generated, skipping"
-            )
-        existing = _existing_session_md(project_dir, session.session_id)
-        if existing and existing.exists():
-            existing.unlink()
-        if state is not None:
-            state.mark_digested(
-                session_path, size=current_size, event_index=len(session.events)
-            )
-            state.save()
-        return
-
-    # Drop empty/trivial sessions
-    if len(session.user_prompts) < min_prompts:
-        if verbose:
-            print(
-                f"[sagent] {session_path.name} has {len(session.user_prompts)} "
-                f"user prompts (< {min_prompts}), dropping"
-            )
-        existing = _existing_session_md(project_dir, session.session_id)
-        if existing and existing.exists():
-            existing.unlink()
-        if state is not None:
-            state.mark_digested(
-                session_path, size=current_size, event_index=len(session.events)
-            )
-            state.save()
-        return
-
-    sess_filename = f"{session.date_prefix}-{session.short_id}.md"
-    out_path = project_dir / "sessions" / sess_filename
-
-    if verbose:
-        print(f"[sagent] {session_path.name} → {out_path.relative_to(out_root)}")
-
-    project_name = _clean_project_name(session_path.parent.name)
-
-    if no_llm:
-        write_session_md(
-            session,
-            out_path,
-            summary_md="(LLM digest skipped — `--no-llm`)\n",
-            understanding_md="",
-            project=project_name,
-        )
-        if state is not None:
-            state.mark_digested(
-                session_path, size=current_size, event_index=len(session.events)
-            )
-            state.save()
-        return
-
-    rec = state.get(session_path) if state is not None else None
-    digest_count = rec.digest_count if rec else 0
-
-    do_incremental = (
-        rec is not None
-        and rec.last_event_index > 0
-        and rec.last_event_index < len(session.events)
-        and not force_full
-        and (full_rebuild_every <= 0 or (digest_count + 1) % full_rebuild_every != 0)
-    )
-    prior_summary = ""
-    prior_understanding = ""
-    if do_incremental:
-        existing = _existing_session_md(project_dir, session.session_id)
-        if existing and existing.exists():
-            prior_text = existing.read_text()
-            # Extract the previous Summary and Understanding sections
-            prior_summary, prior_understanding = _extract_prior_sections(prior_text)
-        if not prior_summary.strip():
-            do_incremental = False
-
-    try:
-        if do_incremental:
-            assert rec is not None
-            new_count = len(session.events) - rec.last_event_index
-            if verbose:
-                print(
-                    f"  … incremental ({new_count} new events, "
-                    f"prior at index {rec.last_event_index})"
-                )
-            summary_md, understanding_md = run_understanding(
-                session,
-                model=model,
-                prior_summary=prior_summary,
-                prior_understanding=prior_understanding,
-                since_event_index=rec.last_event_index,
-                rate_limiter=rate_limiter,
-            )
-        else:
-            if verbose:
-                reason = (
-                    "force-full" if force_full
-                    else "rebuild cycle" if rec and (digest_count + 1) % full_rebuild_every == 0
-                    else "cold start"
-                )
-                print(f"  … full digest ({reason})")
-            summary_md, understanding_md = run_understanding(
-                session, model=model, rate_limiter=rate_limiter
-            )
-    except SagentRateLimitError:
-        # Don't mark state — let the next pass retry once cooldown lifts.
-        raise
-    except Exception as exc:
-        print(f"[sagent] understanding failed for {session_path.name}: {exc}")
-        return
-
-    write_session_md(
-        session,
-        out_path,
-        summary_md=summary_md,
-        understanding_md=understanding_md,
-        project=project_name,
-    )
-
-    if state is not None:
-        state.mark_digested(
-            session_path, size=current_size, event_index=len(session.events)
-        )
-        state.save()
-
-    # Project-level roll-up (or scratchpad recent.md)
-    if skip_rollup:
-        return
-    try:
-        _maybe_rollup(
-            project_dir=project_dir,
-            new_session_path=out_path,
-            session_id=session.session_id,
-            project_source_path=Path(session.cwd) if session.cwd else None,
-            model=model,
-            state=state,
-            force_full=force_full,
-            full_rebuild_every=full_rebuild_every,
-            rate_limiter=rate_limiter,
-            verbose=verbose,
-        )
-    except SagentRateLimitError:
-        raise
-    except Exception as exc:
-        print(f"[sagent] roll-up failed for {project_dir.name}: {exc}")
-
-
-def _extract_prior_sections(session_md: str) -> tuple[str, str]:
-    """Pull the '## Summary' and '## Understanding' bodies from a per-session
-    combined digest."""
-    import re
-
-    def _section(name: str) -> str:
-        m = re.search(rf"^## {name}\s*$\n+(.*?)(?=\n## |\Z)", session_md, re.M | re.S)
-        return m.group(1).strip() if m else ""
-
-    return _section("Summary"), _section("Understanding")
-
-
-def _maybe_rollup(
-    *,
-    project_dir: Path,
-    new_session_path: Path,
-    session_id: str,
-    project_source_path: Path | None,
-    model: str,
-    state: StateStore | None,
-    force_full: bool,
-    full_rebuild_every: int,
-    rate_limiter: RateLimiter | None,
-    verbose: bool,
-) -> None:
-    if is_scratchpad(project_dir.name):
-        update_recent(project_dir)
-        if verbose:
-            print(f"  ✓ updated {project_dir.name}/recent.md")
-        update_index(project_dir.parent)
-        return
-
-    rollup_count = 0
-    if state is not None:
-        prec = state.get_project(project_dir.name)
-        if prec:
-            rollup_count = prec.rollup_count
-
-    if verbose:
-        ctx_note = (
-            f" (with source from {project_source_path})"
-            if project_source_path and Path(project_source_path).exists()
-            else ""
-        )
-        print(f"  … rolling up {project_dir.name}/project.md{ctx_note}")
-    roll_up_project(
-        project_dir,
-        new_session_path=new_session_path,
-        project_source_path=project_source_path,
-        model=model,
-        force_full=force_full,
-        full_rebuild_every=full_rebuild_every,
-        rollup_count=rollup_count,
-        rate_limiter=rate_limiter,
-    )
-    update_index(project_dir.parent)
-    if state is not None:
-        state.mark_rolled_up(project_dir.name, session_id=session_id)
-        state.save()
-
-
-def _make_state(args: argparse.Namespace) -> StateStore | None:
+    Always returns *some* ledger so the pipeline never branches on
+    `ledger is None`.
+    """
     if getattr(args, "no_state", False):
-        return None
-    return StateStore(Path(args.state) if args.state else None)
+        return NullLedger()
+    return DigestLedger(Path(args.state) if args.state else None)
 
 
 def _make_rate_limiter(args: argparse.Namespace) -> RateLimiter | None:
@@ -336,22 +80,42 @@ def _make_rate_limiter(args: argparse.Namespace) -> RateLimiter | None:
     return RateLimiter(max_per_hour=n) if n > 0 else None
 
 
+def _config_from(args: argparse.Namespace, *, out_root: Path) -> DigestConfig:
+    """Build a DigestConfig from a parsed argparse Namespace.
+
+    Tolerant of missing attrs (some subcommands don't expose every flag).
+    """
+    return DigestConfig(
+        out_root=out_root,
+        model=getattr(args, "model", "claude-haiku-4-5"),
+        no_llm=getattr(args, "no_llm", False),
+        force_full=getattr(args, "force_full", False),
+        full_rebuild_every=getattr(args, "full_rebuild_every", 10),
+        min_delta=getattr(args, "min_delta", 0),
+        min_prompts=getattr(args, "min_prompts", 1),
+        skip_rollup=getattr(args, "skip_rollup", False),
+        verbose=True,
+    )
+
+
+def _print_ledger_path(ledger: DigestLedger) -> None:
+    if isinstance(ledger, NullLedger):
+        print("[sagent] state: --no-state (in-memory only)")
+    else:
+        print(f"[sagent] state: {ledger.path}")
+
+
 def cmd_digest(args: argparse.Namespace) -> int:
     session_path = _resolve_input(args.target)
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args)
+    ledger = _make_ledger(args)
     rate_limiter = _make_rate_limiter(args)
+    config = _config_from(args, out_root=out_root)
     try:
-        _digest_one(
+        digest_session(
             session_path,
-            out_root,
-            model=args.model,
-            no_llm=args.no_llm,
-            state=state,
-            force_full=args.force_full,
-            full_rebuild_every=args.full_rebuild_every,
-            min_prompts=args.min_prompts,
-            skip_rollup=args.skip_rollup,
+            config,
+            ledger=ledger,
             rate_limiter=rate_limiter,
         )
     except SagentRateLimitError as exc:
@@ -362,21 +126,12 @@ def cmd_digest(args: argparse.Namespace) -> int:
 
 def cmd_watch(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args)
+    ledger = _make_ledger(args)
     rate_limiter = _make_rate_limiter(args)
+    config = _config_from(args, out_root=out_root)
 
     def on_change(path: Path) -> None:
-        _digest_one(
-            path,
-            out_root,
-            model=args.model,
-            no_llm=args.no_llm,
-            state=state,
-            force_full=args.force_full,
-            full_rebuild_every=args.full_rebuild_every,
-            min_prompts=args.min_prompts,
-            rate_limiter=rate_limiter,
-        )
+        digest_session(path, config, ledger=ledger, rate_limiter=rate_limiter)
 
     if args.target:
         p = Path(args.target).expanduser()
@@ -395,33 +150,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 def cmd_watch_all(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args)
+    ledger = _make_ledger(args)
     rate_limiter = _make_rate_limiter(args)
+    config = _config_from(args, out_root=out_root)
     print(f"[sagent] output root: {out_root}")
-    if state is not None:
-        print(f"[sagent] state: {state.path}")
+    _print_ledger_path(ledger)
     if rate_limiter is not None:
         print(f"[sagent] rate limit: {args.max_per_hour}/hour")
 
     def on_change(path: Path) -> None:
-        _digest_one(
-            path,
-            out_root,
-            model=args.model,
-            no_llm=args.no_llm,
-            state=state,
-            force_full=args.force_full,
-            full_rebuild_every=args.full_rebuild_every,
-            min_prompts=args.min_prompts,
-            rate_limiter=rate_limiter,
-        )
+        digest_session(path, config, ledger=ledger, rate_limiter=rate_limiter)
 
     watch_all(
         on_change,
         min_bytes=args.min_bytes,
         min_delta=args.min_delta,
         quiet_seconds=args.idle_seconds,
-        state=state,
+        ledger=ledger,
         rate_limit_cooldown=args.rate_limit_cooldown,
     )
     return 0
@@ -429,17 +174,20 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
 
 def cmd_digest_all(args: argparse.Namespace) -> int:
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args)
+    ledger = _make_ledger(args)
     rate_limiter = _make_rate_limiter(args)
+    config = _config_from(args, out_root=out_root)
     print(f"[sagent] output root: {out_root}")
-    if state is not None:
-        print(f"[sagent] state: {state.path}")
-    count = 0
-    skipped = 0
+    _print_ledger_path(ledger)
+
+    counts: Counter[str] = Counter()
     # Real projects first, scratchpads last
     projs = [p for p in CLAUDE_PROJECTS.iterdir() if p.is_dir()]
     projs.sort(key=lambda p: (is_scratchpad(p.name), p.name))
+    rate_limited = False
     for proj in projs:
+        if rate_limited:
+            break
         for sess in sorted(proj.glob("*.jsonl")):
             try:
                 size = sess.stat().st_size
@@ -447,28 +195,21 @@ def cmd_digest_all(args: argparse.Namespace) -> int:
                 continue
             if size < args.min_bytes:
                 continue
-            if state is not None and state.should_skip(
-                sess, size=size, min_delta=args.min_delta
-            ):
-                skipped += 1
-                continue
             try:
-                _digest_one(
-                    sess,
-                    out_root,
-                    model=args.model,
-                    no_llm=args.no_llm,
-                    state=state,
-                    force_full=args.force_full,
-                    full_rebuild_every=args.full_rebuild_every,
-                    min_prompts=args.min_prompts,
-                    rate_limiter=rate_limiter,
+                outcome: DigestOutcome = digest_session(
+                    sess, config, ledger=ledger, rate_limiter=rate_limiter
                 )
             except SagentRateLimitError as exc:
                 print(f"[sagent] rate limit hit, stopping: {exc}")
+                rate_limited = True
                 break
-            count += 1
-    print(f"[sagent] digested {count}; skipped {skipped} already-digested")
+            counts[outcome.status] += 1
+
+    print(
+        f"[sagent] digested {counts['digested']}; "
+        f"skipped {counts['skipped']}; "
+        f"dropped {counts['dropped']}"
+    )
     return 0
 
 
@@ -478,7 +219,7 @@ def cmd_rollup(args: argparse.Namespace) -> int:
     Useful after migration or to force-refresh a stale project.md.
     """
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args) if not args.no_state else None
+    ledger = _make_ledger(args)
     project_filter = args.project
 
     if not out_root.exists():
@@ -499,11 +240,7 @@ def cmd_rollup(args: argparse.Namespace) -> int:
             continue
 
         latest = max(sessions_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
-        rollup_count = 0
-        if state is not None:
-            prec = state.get_project(project_dir.name)
-            if prec:
-                rollup_count = prec.rollup_count
+        rollup_claim = ledger.claim_rollup(project_dir.name)
         # Pull cwd from the latest session's front matter for source context
         from .frontmatter import split_front_matter
 
@@ -518,16 +255,14 @@ def cmd_rollup(args: argparse.Namespace) -> int:
             model=args.model,
             force_full=args.force_full,
             full_rebuild_every=args.full_rebuild_every,
-            rollup_count=rollup_count,
+            rollup_count=rollup_claim.prior_count,
         )
-        if state is not None:
-            # use the latest session's id8 as the marker
-            import re
+        # Use the latest session's id8 as the rollup marker.
+        import re
 
-            m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", latest.name)
-            if m:
-                state.mark_rolled_up(project_dir.name, session_id=m.group(1))
-                state.save()
+        m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", latest.name)
+        if m:
+            rollup_claim.commit(session_id=m.group(1))
 
     return 0
 
@@ -539,7 +274,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     re-parses the source JSONL, and drops the .md if user_prompts < min.
     """
     out_root = Path(args.out) if args.out else default_out_dir()
-    state = _make_state(args) if not args.no_state else None
+    ledger = _make_ledger(args)
 
     if not out_root.exists():
         print(f"[sagent] nothing at {out_root}")
@@ -581,17 +316,16 @@ def cmd_prune(args: argparse.Namespace) -> int:
                     )
                 else:
                     md.unlink()
-                    if state is not None:
-                        state.mark_digested(
-                            source,
-                            size=source.stat().st_size,
-                            event_index=len(session.events),
-                        )
+                    ledger.mark_digested(
+                        source,
+                        size=source.stat().st_size,
+                        event_index=len(session.events),
+                    )
                 removed += 1
             else:
                 kept += 1
-    if state is not None and not args.dry_run:
-        state.save()
+    if not args.dry_run:
+        ledger.save()
     verb = "would remove" if args.dry_run else "removed"
     print(
         f"[sagent] {verb} {removed}, kept {kept}, orphans {orphaned}"

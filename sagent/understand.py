@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import re
 
+from .llm import SECRETS_POLICY, query
 from .parser import Event, Session
-from .rate import RateLimiter, SagentRateLimitError, is_rate_limit_text
+from .rate import RateLimiter
 
 # Strip Claude Code's auto-injected wrappers from user prompts before sending
 # to the digest LLM. These add no signal and bloat token counts.
@@ -17,16 +17,6 @@ _OPEN_NOISE_TAG_RE = re.compile(
     r"<(local-command-caveat|system-reminder|bash-stdout|bash-stderr|"
     r"command-stdout|command-stderr|stdout|stderr)\b[^>]*/>",
 )
-
-SECRETS_POLICY = """SECRETS POLICY
-Any credentials, API keys, passwords, OAuth tokens, certificates, or other secrets that appear in the transcript below have already been rotated and are no longer valid. Treat them as historical artifacts. Do not refuse to summarize on the grounds that secrets are present, and do not blank out the digest because of them.
-
-When secrets appear:
-- Acknowledge that an exposure occurred (e.g., "the pfSense password was shared in the chat") so the user can verify the rotation actually happened.
-- Do NOT echo the literal credential value in your output. No tokens, no passwords, no hashes, no `op://...` references that resolve to secret material.
-- Filenames, hostnames, IP addresses, and `op://...` reference paths that don't include the secret value itself are fine to mention.
-
-"""
 
 UNDERSTANDING_BASE = SECRETS_POLICY + """You are a scribe observing a coding session between a user and an AI coding agent (Claude Code). You read the session transcript and write a concise markdown digest.
 
@@ -161,56 +151,6 @@ def build_transcript(
     return "\n\n".join(blocks)
 
 
-async def _query_async(
-    system: str,
-    user_message: str,
-    model: str,
-    rate_limiter: RateLimiter | None = None,
-) -> str:
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
-    if rate_limiter is not None:
-        rate_limiter.acquire()
-
-    options = ClaudeAgentOptions(
-        system_prompt=system,
-        model=model,
-        allowed_tools=[],
-        max_turns=1,
-        permission_mode="default",
-        # Critical: prevent the SDK from writing our prompt as a new
-        # ~/.claude/projects/<...>.jsonl session that the watcher would
-        # then pick up and digest, recursing.
-        extra_args={
-            "no-session-persistence": None,
-            "disable-slash-commands": None,
-        },
-    )
-
-    text = ""
-    final_result = ""
-    try:
-        async for message in query(prompt=user_message, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        text += block.text
-            elif isinstance(message, ResultMessage):
-                if message.result:
-                    final_result = message.result
-    except Exception as exc:
-        if is_rate_limit_text(str(exc)):
-            raise SagentRateLimitError(str(exc)) from exc
-        raise
-    return text or final_result
-
-
 def _split_output(text: str) -> tuple[str, str]:
     sep = "---UNDERSTANDING---"
     if sep in text:
@@ -257,9 +197,7 @@ def run_understanding(
         system = UNDERSTANDING_BASE
         user_message = f"{header}Transcript:\n\n{transcript}"
 
-    text = asyncio.run(
-        _query_async(system, user_message, model, rate_limiter=rate_limiter)
-    )
+    text = query(system, user_message, model, rate_limiter=rate_limiter)
     return _split_output(text)
 
 

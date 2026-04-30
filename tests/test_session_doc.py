@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sagent.digest import (
+from sagent.session_doc import (
     _tool_summary,
     _truncate,
     build_timeline,
