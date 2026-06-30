@@ -163,6 +163,8 @@ class ProjectDoc:
 
         counts = self.section_bullet_counts()
 
+        days_since = _days_since_last_session(session_files, now=now)
+
         return {
             "type": "project",
             "source": "claude-code",
@@ -172,10 +174,11 @@ class ProjectDoc:
             "last_updated": last_updated,
             "session_count": len(session_files),
             "sessions_last_7d": sessions_last_7d,
-            "days_since_last_session": _days_since_last_session(
-                session_files, now=now
+            "days_since_last_session": days_since,
+            "momentum": decay_momentum(
+                momentum_bucket(sessions_last_7d, sessions_prior_7d),
+                days_since,
             ),
-            "momentum": momentum_bucket(sessions_last_7d, sessions_prior_7d),
             "decisions": counts.get("Long-term decisions", 0)
             + counts.get("Decisions", 0),
             "open_threads": counts.get("Open threads", 0),
@@ -328,6 +331,26 @@ def momentum_bucket(last_7d: int, prior_7d: int) -> str:
     if last_7d < prior_7d:
         return "cooling"
     return "steady"
+
+
+def decay_momentum(momentum: str, days_since: int | None) -> str:
+    """Override momentum so the surfaced value reflects calendar reality.
+
+    The activity bucket alone goes stale: a `rising` value persists in
+    front matter for weeks after the last session because nothing recomputes
+    it. Anchor the surfaced value to recency instead:
+
+    - < 7 days (or unknown):  keep the computed bucket
+    - 7–14 days:              force `cooling`
+    - >= 14 days:             force `cold`
+    """
+    if days_since is None:
+        return momentum
+    if days_since >= 14:
+        return "cold"
+    if days_since >= 7:
+        return "cooling"
+    return momentum
 
 
 def _as_int(value: Any) -> int:
