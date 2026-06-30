@@ -7,6 +7,7 @@ from pathlib import Path
 from sagent.project_doc import (
     ProjectDoc,
     build_headline_block,
+    decay_momentum,
     diff_front_matter,
     momentum_bucket,
 )
@@ -108,6 +109,27 @@ def test_momentum_bucket_rising():
     assert momentum_bucket(1, 0) == "rising"
 
 
+def test_decay_momentum_recent_keeps_computed():
+    assert decay_momentum("rising", 0) == "rising"
+    assert decay_momentum("rising", 6) == "rising"
+    assert decay_momentum("steady", 3) == "steady"
+
+
+def test_decay_momentum_unknown_days_keeps_computed():
+    assert decay_momentum("rising", None) == "rising"
+    assert decay_momentum("cold", None) == "cold"
+
+
+def test_decay_momentum_forces_cooling_at_7_to_13_days():
+    assert decay_momentum("rising", 7) == "cooling"
+    assert decay_momentum("rising", 13) == "cooling"
+
+
+def test_decay_momentum_forces_cold_at_14_days_or_more():
+    assert decay_momentum("rising", 14) == "cold"
+    assert decay_momentum("cooling", 57) == "cold"
+
+
 def test_days_since_last_session_empty():
     assert _days_since_last_session([], now=time.time()) is None
 
@@ -184,6 +206,26 @@ def test_derive_front_matter_cooling(tmp_path: Path):
     fm = _doc().derive_front_matter(sessions_dir=sessions, now=now)
     assert fm["sessions_last_7d"] == 1
     assert fm["momentum"] == "cooling"
+
+
+def test_derive_front_matter_decays_to_cooling_after_a_week(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    _make_session(sessions, "s1.md", now - 9 * 86_400)
+    fm = _doc().derive_front_matter(sessions_dir=sessions, now=now)
+    assert fm["days_since_last_session"] == 9
+    assert fm["momentum"] == "cooling"
+
+
+def test_derive_front_matter_decays_to_cold_after_two_weeks(tmp_path: Path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    now = time.time()
+    _make_session(sessions, "s1.md", now - 57 * 86_400)
+    fm = _doc().derive_front_matter(sessions_dir=sessions, now=now)
+    assert fm["days_since_last_session"] == 57
+    assert fm["momentum"] == "cold"
 
 
 def test_derive_front_matter_cold_with_old_sessions(tmp_path: Path):
