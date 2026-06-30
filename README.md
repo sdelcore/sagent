@@ -200,6 +200,7 @@ source: "claude-code"
 project: "src-droidcode"
 description: "Vite+Tauri 2 desktop app for Claude Code; migrated from React Native/Expo."
 tagline: "Phase 1+2 done; Phase 3 (UI routes) pending"
+remote_url: "git@github.com:acme/droidcode.git"
 last_updated: "2026-04-22T13:00:00Z"
 session_count: 17
 sessions_last_7d: 3
@@ -215,6 +216,14 @@ risks: 6
 emits both as `DESCRIPTION:` / `TAGLINE:` leading lines; sagent parses
 them, caps `description` at the last word boundary with `…`, and lifts
 both into front matter.
+
+`remote_url` is the project's `git remote get-url origin`, captured from
+the live repo at roll-up time. Because sagent keys projects by filesystem
+path, a renamed or transferred repo would otherwise split into two
+unrelated digests. When two project keys share a remote, both digests gain
+a `rebrand_detected: "<old-key> → <new-key>"` line (newest by
+`last_updated` is treated as canonical) so the rename can be reconciled.
+It flags only — digests are never merged automatically.
 
 **Per-session `<date>-<id8>.md`:**
 

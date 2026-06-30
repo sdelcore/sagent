@@ -15,6 +15,7 @@ from .pipeline import (
     digest_session,
 )
 from .rate import RateLimiter, SagentRateLimitError
+from .rebrand import detect_rebrands
 from .rollup import is_scratchpad, roll_up_project, update_recent
 from .state import DigestLedger, NullLedger, default_state_path
 from .watcher import (
@@ -263,6 +264,10 @@ def cmd_rollup(args: argparse.Namespace) -> int:
         m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", latest.name)
         if m:
             rollup_claim.commit(session_id=m.group(1))
+
+    for key, flag in detect_rebrands(out_root):
+        if flag:
+            print(f"[sagent] rebrand detected: {key} → {flag}")
 
     return 0
 

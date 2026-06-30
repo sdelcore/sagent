@@ -20,6 +20,7 @@ from .frontmatter import split_front_matter
 from .parser import load_session
 from .project_context import read_project_context
 from .rate import RateLimiter, SagentRateLimitError
+from .rebrand import detect_rebrands
 from .rollup import (
     is_scratchpad,
     roll_up_project,
@@ -339,6 +340,7 @@ def _maybe_rollup(
         rate_limiter=rate_limiter,
     )
     update_index(project_dir.parent)
+    detect_rebrands(project_dir.parent)
     rollup_claim.commit(session_id=session_id)
 
 

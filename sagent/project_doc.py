@@ -133,11 +133,14 @@ class ProjectDoc:
         sessions_dir: Path,
         now: float | None = None,
         last_updated: str | None = None,
+        remote_url: str | None = None,
     ) -> dict[str, Any]:
         """Build the front-matter dict from doc fields and session stats.
 
         `sessions_dir` is the directory of per-session `.md` files; mtimes
-        drive the recent-activity counts. `now` and `last_updated` are
+        drive the recent-activity counts. `remote_url` is the project's git
+        remote (captured by the caller) and is stored verbatim so rebrand
+        detection can cross-walk renamed repos. `now` and `last_updated` are
         injectable for deterministic tests.
         """
         if now is None:
@@ -171,6 +174,7 @@ class ProjectDoc:
             "project": self.name,
             "description": self.description,
             "tagline": self.tagline,
+            "remote_url": remote_url,
             "last_updated": last_updated,
             "session_count": len(session_files),
             "sessions_last_7d": sessions_last_7d,
