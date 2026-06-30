@@ -240,6 +240,19 @@ def test_derive_front_matter_cold_with_old_sessions(tmp_path: Path):
     assert fm["days_since_last_session"] == 30
 
 
+def test_derive_front_matter_stores_remote_url(tmp_path: Path):
+    fm = _doc().derive_front_matter(
+        sessions_dir=tmp_path / "sessions",
+        remote_url="git@github.com:acme/core.git",
+    )
+    assert fm["remote_url"] == "git@github.com:acme/core.git"
+
+
+def test_derive_front_matter_remote_url_defaults_null(tmp_path: Path):
+    fm = _doc().derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["remote_url"] is None
+
+
 def test_derive_front_matter_counts_section_bullets():
     body = (
         "## Long-term decisions\n- a\n- b\n"

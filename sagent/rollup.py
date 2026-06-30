@@ -24,6 +24,7 @@ from .llm import SECRETS_POLICY, query
 from .project_context import read_project_context
 from .project_doc import ProjectDoc, diff_front_matter
 from .rate import RateLimiter
+from .rebrand import git_remote_url
 
 
 def _user() -> str:
@@ -455,12 +456,19 @@ def roll_up_project(
         )
 
     doc = ProjectDoc.parse(text, name=project_name)
-    fm = doc.derive_front_matter(sessions_dir=sessions_dir)
-    body = doc.render_body(front_matter=fm)
 
     # Read prior front matter BEFORE overwriting so we can diff numeric
     # counts and append a changelog entry. Pure derivation — no LLM call.
     prior_fm, _ = split_front_matter(_read_file(project_md_path))
+
+    # Capture the live repo's remote so a later rename can be cross-walked.
+    # If the source path is gone on this host, keep whatever we last saw
+    # rather than nulling a previously-captured remote.
+    remote_url = git_remote_url(project_source_path) or prior_fm.get("remote_url")
+
+    fm = doc.derive_front_matter(sessions_dir=sessions_dir, remote_url=remote_url)
+    body = doc.render_body(front_matter=fm)
+
     delta_line = diff_front_matter(prior_fm, fm)
     if delta_line:
         _append_changelog_entry(project_dir, delta_line)
