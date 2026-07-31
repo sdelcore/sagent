@@ -35,7 +35,10 @@
           nativeBuildInputs = with python.pkgs; [ hatchling ];
           propagatedBuildInputs = [ claude-agent-sdk ];
           doCheck = true;
-          nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
+          # git is a real test dependency, not a build convenience: rebrand
+          # detection shells out to `git remote get-url origin`, and its test
+          # exercises that call. Without git on PATH the sandbox fails it.
+          nativeCheckInputs = [ python.pkgs.pytestCheckHook pkgs.git ];
           pythonImportsCheck = [
             "sagent"
             "sagent.cli"
