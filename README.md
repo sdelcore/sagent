@@ -1,8 +1,9 @@
 # sagent
 
 A scribe for coding-agent sessions. It reads what your agents already
-wrote to disk and produces markdown digests in your Obsidian vault (or
-any directory you point it at):
+wrote to disk and produces markdown digests in any directory you point
+it at — `~/.sagent/<hostname>/` by default, an Obsidian vault if you
+prefer:
 
 - a **per-session** file capturing what happened (Summary + Understanding),
   plus a byte-exact record of every command run
@@ -50,13 +51,14 @@ imports = [ inputs.sagent.homeModules.default ];
 services.sagent = {
   enable = true;
   maxPerHour = 7;      # cap LLM calls per host — see Rate limiting
+  # outDir = "${config.home.homeDirectory}/Obsidian/sagent/nightman";
 };
 ```
 
 Rebuild, and sagent runs as a user systemd service writing to
-`~/Obsidian/sagent/<hostname>/`. The unit already carries its runtime
-dependencies, including `git` — rebrand detection shells out to it and fails
-silently without it.
+`~/.sagent/<hostname>/`. Set `outDir` to put the digests in a vault
+instead. The unit already carries its runtime dependencies, including
+`git` — rebrand detection shells out to it and fails silently without it.
 
 Options are declared in [`nix/hm-module.nix`](nix/hm-module.nix); read that
 rather than a copy here, which is how the previous version of this section
@@ -112,7 +114,7 @@ flags worth knowing up front:
 ## Output layout
 
 ```
-~/Obsidian/sagent/<hostname>/
+<out-root>/                             # $SAGENT_OUT, --out, or ~/.sagent/<hostname>/
   INDEX.md                              # fleet-wide overview, auto-regenerated
   <project>/
     project.md                          # cumulative rolling digest (real projects)
@@ -432,11 +434,12 @@ your prompts briefly. The `source_jsonl` field in front matter points
 at the verbatim Claude Code session. Front matter `cwd`, `branch`, and
 `gist` are visible to anything that reads the directory.
 
-If your output dir is synced to a third-party service (Obsidian Sync,
-iCloud, Dropbox, Syncthing-to-cloud), your digests propagate there.
-The default `~/Obsidian/sagent/<hostname>/` layout is conflict-free
-across machines (per-host subdir) but as public/private as the vault
-you put it in.
+The default `~/.sagent/<hostname>/` is local and syncs nowhere. Point
+`--out` or `$SAGENT_OUT` at a vault and your digests inherit that
+vault's reach — Obsidian Sync, iCloud, Dropbox and Syncthing-to-cloud
+all propagate them off the machine. Give each host its own subdirectory
+there; the per-host root is what keeps two machines from merging their
+indexes.
 
 ## Design
 

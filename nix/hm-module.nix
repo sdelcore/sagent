@@ -10,15 +10,10 @@
 #   imports = [ inputs.sagent.homeModules.default ];
 #   services.sagent = { enable = true; maxPerHour = 7; };
 { self }:
-{ lib, config, pkgs, ... }@args:
+{ lib, config, pkgs, ... }:
 
 let
   cfg = config.services.sagent;
-
-  # `osConfig` exists only when home-manager runs as a NixOS module. Guard it
-  # so the module also evaluates in a standalone home-manager config.
-  hostFromOs =
-    if args ? osConfig then (args.osConfig.networking.hostName or null) else null;
 
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
@@ -48,21 +43,21 @@ in
       description = "The sagent package to run.";
     };
 
-    hostname = lib.mkOption {
-      type = lib.types.str;
-      default = if hostFromOs != null then hostFromOs else "unknown-host";
-      defaultText = lib.literalExpression "osConfig.networking.hostName";
-      description = ''
-        Name this machine writes under. Digests are keyed `<host>/<project>`,
-        so a synced vault holding several machines needs this to differ.
-      '';
-    };
-
     outDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.home.homeDirectory}/Obsidian/sagent/${cfg.hostname}";
-      defaultText = lib.literalExpression ''"''${config.home.homeDirectory}/Obsidian/sagent/''${hostname}"'';
-      description = "Root directory for digest output.";
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/home/alice/Obsidian/sagent/laptop";
+      description = ''
+        Root directory for digest output. When null the module sets no
+        `SAGENT_OUT` and sagent falls back to its own default,
+        `~/.sagent/<hostname>`.
+
+        Null rather than a computed path on purpose: a default written here
+        as well as in the CLI is two defaults, and the pair drifts silently
+        because nothing compares them. Point this at a vault when you want
+        the digests synced. Digests are keyed `<host>/<project>`, so give
+        each machine its own directory inside a shared vault.
+      '';
     };
 
     model = lib.mkOption {
@@ -137,7 +132,6 @@ in
         Type = "simple";
         ExecStart = "${launcher}";
         Environment = [
-          "SAGENT_OUT=${cfg.outDir}"
           # git is a RUNTIME dependency, not only a build one: rebrand
           # detection shells out to `git remote get-url origin`, and
           # git_remote_url swallows the resulting OSError and returns None
@@ -154,7 +148,7 @@ in
             lib.makeBinPath ([ pkgs.coreutils pkgs.git ] ++ cfg.extraPath)
           }"
           "HOME=${config.home.homeDirectory}"
-        ];
+        ] ++ lib.optional (cfg.outDir != null) "SAGENT_OUT=${cfg.outDir}";
         Restart = "on-failure";
         RestartSec = "30s";
       };

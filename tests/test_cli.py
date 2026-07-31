@@ -25,19 +25,24 @@ def test_default_out_dir_env(monkeypatch, tmp_path: Path):
     assert default_out_dir() == tmp_path / "o"
 
 
-def test_default_out_dir_obsidian(monkeypatch, tmp_path: Path):
+def test_default_out_dir_is_a_dot_dir_under_home(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("SAGENT_OUT", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    out = default_out_dir()
+    assert out == tmp_path / ".sagent" / __import__("socket").gethostname()
+
+
+def test_default_out_dir_ignores_an_obsidian_vault(monkeypatch, tmp_path: Path):
+    """The default must not depend on what else is installed.
+
+    sagent used to write into ~/Obsidian when that directory happened to
+    exist, so the same command landed in different places on different
+    machines. A vault is now opt-in, never sniffed.
+    """
     monkeypatch.delenv("SAGENT_OUT", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     (tmp_path / "Obsidian").mkdir()
-    out = default_out_dir()
-    assert out == tmp_path / "Obsidian" / "sagent" / __import__("socket").gethostname()
-
-
-def test_default_out_dir_fallback(monkeypatch, tmp_path: Path):
-    monkeypatch.delenv("SAGENT_OUT", raising=False)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    # no Obsidian dir
-    assert default_out_dir() == Path("sagent-out")
+    assert default_out_dir() == tmp_path / ".sagent" / __import__("socket").gethostname()
 
 
 # ---------------------------------------------------------------------------
