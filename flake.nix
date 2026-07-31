@@ -66,5 +66,11 @@
             export UV_PYTHON_DOWNLOADS=never
           '';
         };
-      });
+      }) // {
+        # Outside eachDefaultSystem on purpose: a home-manager module is
+        # system-independent and resolves the package from the importing
+        # config's own pkgs.
+        homeModules.default = import ./nix/hm-module.nix { inherit self; };
+        homeModules.sagent = self.homeModules.default;
+      };
 }

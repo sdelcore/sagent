@@ -1,21 +1,31 @@
 # sagent
 
-A scribe for Claude Code sessions. It watches the JSONL session files
-Claude Code writes under `~/.claude/projects/`, and produces markdown
-digests in your Obsidian vault (or any directory you point it at):
+A scribe for coding-agent sessions. It reads what your agents already
+wrote to disk and produces markdown digests in your Obsidian vault (or
+any directory you point it at):
 
-- a **per-session** file capturing what happened (Summary + Understanding)
+- a **per-session** file capturing what happened (Summary + Understanding),
+  plus a byte-exact record of every command run
 - a **per-project** rolling digest (`project.md`) that accumulates
-  decisions, open threads, preferences, and risks across sessions
+  decisions, open threads, preferences, and risks — and lets them
+  resolve, supersede, or go stale rather than only pile up
 - a **per-host index** (`INDEX.md`) listing every project at a glance
+
+Two harnesses are supported, and they share one `project.md` per
+directory — the same work through a different tool is still the same work:
+
+| Harness | Source | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/projects/**/*.jsonl` | one file per session |
+| opencode | `~/.local/share/opencode/opencode.db` | one SQLite database for everything; needs the `opencode` binary for content export |
 
 Every output starts with **YAML front matter** so a downstream agent
 can triage many projects without loading full bodies.
 
-It runs out-of-band from Claude Code itself — invisible to the primary
-agent. See `research.md` for the full design space, prior art (MemGPT,
-Letta, the ClawPort "scribe" pattern, Cursor Automations), and the
-honest case against building this.
+It runs out-of-band from the agents themselves — invisible to them. See
+`research.md` for the full design space, prior art (MemGPT, Letta, the
+ClawPort "scribe" pattern, Cursor Automations), and the honest case
+against building this.
 
 ## Install
 
@@ -29,80 +39,32 @@ nix run github:sdelcore/sagent -- digest-all    # everything in one pass
 
 ### As a home-manager module
 
-Add sagent as a flake input and write a small home-manager module that
-wraps `inputs.sagent.packages.${pkgs.system}.default` in a systemd user
-service. Reference module (extracted from the maintainer's infra repo):
+The module ships with the flake, so there is nothing to write:
 
 ```nix
-# home/modules/sagent.nix
-{ inputs, lib, config, pkgs, osConfig, ... }:
-let
-  cfg = config.services.sagent;
-  sagent = inputs.sagent.packages.${pkgs.system}.default;
-  hostname = osConfig.networking.hostName or "unknown-host";
-  launcher = pkgs.writeShellScript "sagent-launcher" ''
-    set -eu
-    ${lib.optionalString (cfg.apiKeyFile != null) ''
-      if [ -s "${toString cfg.apiKeyFile}" ]; then
-        ANTHROPIC_API_KEY="$(${pkgs.coreutils}/bin/cat "${toString cfg.apiKeyFile}")"
-        export ANTHROPIC_API_KEY
-      fi
-    ''}
-    exec ${cfg.package}/bin/sagent watch-all \
-      --model ${lib.escapeShellArg cfg.model} \
-      --max-per-hour ${toString cfg.maxPerHour} \
-      --rate-limit-cooldown ${toString cfg.rateLimitCooldown} \
-      ${lib.escapeShellArgs cfg.extraArgs}
-  '';
-in {
-  options.services.sagent = {
-    enable = lib.mkEnableOption "sagent — Claude Code session scribe";
-    package = lib.mkOption { type = lib.types.package; default = sagent; };
-    outDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.home.homeDirectory}/Obsidian/sagent/${hostname}";
-    };
-    model = lib.mkOption { type = lib.types.str; default = "claude-haiku-4-5"; };
-    maxPerHour = lib.mkOption { type = lib.types.int; default = 0; };
-    rateLimitCooldown = lib.mkOption { type = lib.types.int; default = 1800; };
-    apiKeyFile = lib.mkOption { type = lib.types.nullOr lib.types.path; default = null; };
-    extraArgs = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
-  };
-  config = lib.mkIf cfg.enable {
-    home.packages = [ cfg.package ];
-    systemd.user.services.sagent = {
-      Unit = { Description = "sagent — Claude Code session scribe"; After = [ "default.target" ]; };
-      Service = {
-        Type = "simple";
-        ExecStart = "${launcher}";
-        Environment = [
-          "SAGENT_OUT=${cfg.outDir}"
-          "PATH=${config.home.homeDirectory}/.local/bin:${lib.makeBinPath [ pkgs.coreutils ]}"
-          "HOME=${config.home.homeDirectory}"
-        ];
-        Restart = "on-failure";
-        RestartSec = "30s";
-      };
-      Install.WantedBy = [ "default.target" ];
-    };
-  };
-}
-```
+# flake.nix
+inputs.sagent.url = "github:sdelcore/sagent";
 
-Then enable it on a host:
-
-```nix
 # home/<hostname>.nix
-imports = [ ./modules/sagent.nix ];
+imports = [ inputs.sagent.homeModules.default ];
 services.sagent = {
   enable = true;
-  maxPerHour = 15;     # cap LLM calls per host (see Rate limiting below)
+  maxPerHour = 7;      # cap LLM calls per host — see Rate limiting
 };
 ```
 
-`just switch <hostname>` (or your equivalent rebuild command) and
-sagent runs as a user systemd service. Output lands in
-`~/Obsidian/sagent/<hostname>/`.
+Rebuild, and sagent runs as a user systemd service writing to
+`~/Obsidian/sagent/<hostname>/`. The unit already carries its runtime
+dependencies, including `git` — rebrand detection shells out to it and fails
+silently without it.
+
+Options are declared in [`nix/hm-module.nix`](nix/hm-module.nix); read that
+rather than a copy here, which is how the previous version of this section
+came to document a bug. The ones worth knowing: `apiKeyFile` (bill an
+Anthropic key instead of your Claude subscription), `maxPerHour`, `outDir`,
+`model`, and `extraArgs` for anything the CLI takes but the module does not
+name.
+
 
 ### Dev shell
 
@@ -111,7 +73,7 @@ git clone https://github.com/sdelcore/sagent
 cd sagent
 nix develop
 uv sync
-uv run pytest          # 89 tests
+uv run pytest          # 464 tests
 uv run sagent list -v
 ```
 
@@ -119,42 +81,33 @@ uv run sagent list -v
 
 ```
 sagent [options] COMMAND [args]
-
-commands:
-  digest [PATH]        digest a single session (default: current cwd's latest)
-  digest-all           digest every session across every project
-  watch [PATH]         watch one session/project, digest on append settle
-  watch-all            watch every project, digest each session as it settles
-  rollup [PROJECT]     re-run project-level rollup against existing digests
-  prune                delete output dirs whose source has < N user prompts
-  purge-self           delete sagent-self-generated JSONL files (legacy cleanup)
-  list [-v]            inventory Claude Code projects with sessions
-
-common flags:
-  --out PATH                output root (default: $SAGENT_OUT or
-                            ~/Obsidian/sagent/<hostname>/ or ./sagent-out)
-  --model MODEL             model id (default: claude-haiku-4-5)
-  --no-llm                  rule-based output only, no LLM cost
-  --state PATH              state file path (default: $SAGENT_STATE or
-                            ~/.local/state/sagent/state.json)
-  --no-state                run cold every time, ignore state
-  --force-full              rebuild summary from scratch, ignore prior
-  --full-rebuild-every N    periodic drift reset (default: 10; 0 disables)
-  --min-prompts N           drop sessions with < N user prompts (default: 1)
-  --skip-rollup             skip the project-level rollup after a digest
-                            (digest only)
-
-watch-all extra:
-  --idle-seconds N          idle threshold before digesting (default: 300)
-  --min-bytes N             skip sessions smaller than N bytes (default: 5000)
-  --min-delta N             skip if file grew < N bytes since last digest
-  --max-per-hour N          cap LLM calls per rolling hour (default: 0 = none)
-  --rate-limit-cooldown N   sleep N seconds when API reports throttle (1800)
 ```
 
-`PATH` can be a `.jsonl` file, a Claude Code project directory under
-`~/.claude/projects/`, or a repo path (e.g. `~/src/myproj`) — sagent will
-translate the repo path to the encoded project dir.
+| Command | What it does |
+|---|---|
+| `digest [TARGET]` | digest one session (default: current cwd's latest) |
+| `digest-all` | digest every session across every project |
+| `watch [TARGET]` | watch one session/project, digest when it settles |
+| `watch-all` | watch everything, both harnesses — this is what the service runs |
+| `rollup [PROJECT]` | re-run the project roll-up against existing digests |
+| `prune` / `purge-self` | drop thin output dirs / clean up legacy self-digests |
+| `list [-v]` | inventory projects with sessions, per harness |
+
+`TARGET` is a `.jsonl` file, a Claude Code project directory, a repo path
+(`~/src/myproj` — translated to the encoded project dir), or an opencode
+session id with `--harness opencode`.
+
+Run `sagent --help` or `sagent COMMAND --help` for the full flag list; it is
+generated from the parser and cannot drift the way a copy here would. The
+flags worth knowing up front:
+
+| Flag | Why |
+|---|---|
+| `--no-llm` | rule-based output only, no API cost — good for a first look |
+| `--harness {claude-code,opencode,all}` | restrict to one source (default: all) |
+| `--min-prompts N` | drop sessions thinner than N user prompts |
+| `--max-per-hour N` | cap LLM calls per rolling hour (`watch-all`) |
+| `--idle-seconds N` | how long a session must sit still before digesting |
 
 ## Output layout
 
@@ -407,18 +360,27 @@ runs the project rollup. Most useful for spot-checking.
 
 ### `sagent digest-all`
 
-Sweeps every session in `~/.claude/projects/`, digesting each one. Real
-projects are processed before scratchpads. Honors `--min-bytes`,
+Sweeps every session from both harnesses, digesting each one. Real projects
+are processed before scratchpads, so the high-value cumulative digests are
+not starved behind thousands of one-off sessions. Honors `--min-bytes`,
 `--min-delta`, `--min-prompts`, `--max-per-hour`. Stops on
 `SagentRateLimitError`.
 
 ### `sagent watch-all`
 
-The main daemon mode. Polls every `.jsonl` under
-`~/.claude/projects/` on a 2s interval. Fires a digest after writes
-have been quiet for `--idle-seconds` (default **300** = 5 min) — long
-enough that we don't summarize mid-turn. Hydrates from state on
-startup so a service restart doesn't re-digest the corpus.
+The main daemon mode, and what the systemd service runs. Sweeps both
+harnesses: Claude Code's `.jsonl` files on a 2s filesystem scan, and the
+opencode database on a slower 30s clock (`--db-poll-seconds`), since a
+handful of SQLite queries is not free and the settle window is minutes wide
+anyway.
+
+Fires a digest after a session has been quiet for `--idle-seconds` (default
+**300** = 5 min) — long enough not to summarize mid-turn. Hydrates from state
+on startup so a service restart doesn't re-digest the corpus.
+
+Liveness for opencode comes from the rows, never the database file's mtime:
+under WAL, with a long-lived opencode server holding the connection, that
+mtime was measured **8 minutes** behind the newest session data.
 
 ### `sagent watch [PATH]`
 
@@ -498,7 +460,7 @@ with multi-source plugins (OpenCode, others) coming later.
 ```bash
 nix develop                # or direnv allow
 uv sync
-uv run pytest              # 89 tests
+uv run pytest              # 464 tests
 nix build .#sagent         # build the installable package
 ./result/bin/sagent list -v
 ```
