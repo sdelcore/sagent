@@ -119,3 +119,55 @@ def test_build_transcript_filters_noise():
     # user + assistant text kept
     assert "please build it" in out
     assert "done" in out
+
+
+# ---------------------------------------------------------------------------
+# Harness casing — opencode spells the same tools in lower case
+# ---------------------------------------------------------------------------
+
+
+def _oc(name: str, inp: dict) -> Event:
+    return Event(
+        kind="tool_use",
+        uuid="",
+        parent_uuid=None,
+        timestamp=None,
+        tool_name=name,
+        tool_input=inp,
+    )
+
+
+def test_brief_tool_reads_the_opencode_bash_command():
+    # Without a case fold this rendered as a bare "bash" and the LLM saw no
+    # command at all.
+    assert _brief_tool(_oc("bash", {"command": "nix flake check"})) == (
+        "bash: nix flake check"
+    )
+
+
+def test_brief_tool_reads_the_opencode_camel_case_path_key():
+    assert _brief_tool(_oc("read", {"filePath": "/a/b.nix"})) == "read /a/b.nix"
+
+
+def test_brief_tool_names_the_files_an_apply_patch_touched():
+    patch = "*** Update File: a.nix\n*** Add File: b.nix\n"
+    assert _brief_tool(_oc("apply_patch", {"patchText": patch})) == (
+        "apply_patch a.nix, b.nix"
+    )
+
+
+def test_brief_tool_of_a_patch_without_targets_is_just_the_name():
+    assert _brief_tool(_oc("apply_patch", {"patchText": "nothing"})) == "apply_patch"
+
+
+def test_brief_tool_reads_the_opencode_subagent_tool():
+    out = _brief_tool(
+        _oc("task", {"subagent_type": "general", "description": "check the flake"})
+    )
+    assert out == "task[general]: check the flake"
+
+
+def test_brief_tool_echoes_the_name_the_harness_wrote():
+    # Claude Code casing must survive untouched.
+    assert _brief_tool(_oc("Bash", {"command": "ls"})) == "Bash: ls"
+    assert _brief_tool(_oc("Read", {"file_path": "/a"})) == "Read /a"

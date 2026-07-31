@@ -5,6 +5,7 @@ import re
 from .llm import SECRETS_POLICY, query
 from .parser import Event, Session
 from .rate import RateLimiter
+from .session_doc import patch_targets
 
 # Strip Claude Code's auto-injected wrappers from user prompts before sending
 # to the digest LLM. These add no signal and bloat token counts.
@@ -72,31 +73,49 @@ def _strip_noise_tags(text: str) -> str:
 
 
 def _brief_tool(e: Event) -> str:
-    """Compact tool signature: name + minimal target. No full inputs."""
+    """Compact tool signature: name + minimal target. No full inputs.
+
+    Matching folds case and both key conventions, because the two harnesses
+    spell the same tool differently: Claude Code emits `Edit`/`file_path`,
+    opencode emits `read`/`filePath`. Without the fold every opencode tool
+    call reaches the LLM as a bare name with no target, which is the one
+    thing the transcript exists to carry. The name is echoed back as the
+    harness wrote it.
+    """
     name = e.tool_name or "?"
+    key = name.lower()
     inp = e.tool_input or {}
-    if name in ("Edit", "Write", "Read", "NotebookEdit"):
-        target = inp.get("file_path") or inp.get("notebook_path") or ""
+    if key in ("edit", "write", "read", "notebookedit", "multiedit"):
+        target = (
+            inp.get("file_path")
+            or inp.get("filePath")
+            or inp.get("notebook_path")
+            or inp.get("notebookPath")
+            or ""
+        )
         return f"{name} {target}" if target else name
-    if name == "Bash":
+    if key in ("apply_patch", "patch"):
+        targets = patch_targets(inp)
+        return f"{name} {', '.join(targets[:5])}" if targets else name
+    if key == "bash":
         cmd = (inp.get("command") or "").strip()
-        return f"Bash: {cmd[:80]}"
-    if name == "Grep":
+        return f"{name}: {cmd[:80]}"
+    if key == "grep":
         pat = inp.get("pattern", "")
-        return f"Grep {pat!r}"
-    if name == "Glob":
-        return f"Glob {inp.get('pattern', '')}"
-    if name in ("WebSearch", "WebFetch"):
+        return f"{name} {pat!r}"
+    if key == "glob":
+        return f"{name} {inp.get('pattern', '')}"
+    if key in ("websearch", "webfetch"):
         q = inp.get("query") or inp.get("url") or ""
         return f"{name} {q[:80]}"
-    if name == "TaskCreate":
-        return f"TaskCreate: {(inp.get('subject') or '')[:80]}"
-    if name == "TaskUpdate":
-        return f"TaskUpdate"
-    if name == "Agent":
+    if key == "taskcreate":
+        return f"{name}: {(inp.get('subject') or '')[:80]}"
+    if key == "taskupdate":
+        return name
+    if key in ("agent", "task"):
         sub = inp.get("subagent_type", "general")
         desc = inp.get("description", "")
-        return f"Agent[{sub}]: {desc[:60]}" if desc else f"Agent[{sub}]"
+        return f"{name}[{sub}]: {desc[:60]}" if desc else f"{name}[{sub}]"
     return name
 
 

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import time
 from pathlib import Path
 
 from sagent.project_doc import (
+    CANONICAL_SECTIONS,
+    DEFAULT_HARNESS,
+    STALE_AFTER_DAYS,
     ProjectDoc,
     build_headline_block,
+    canonical_section_name,
     decay_momentum,
+    decay_stale_threads,
     diff_front_matter,
+    is_valid_rollup_output,
+    merge_harnesses,
     momentum_bucket,
 )
 from sagent.project_doc import (
@@ -557,3 +565,587 @@ def test_diff_momentum_only_when_present_and_changed():
     same = {**prior, "momentum": "rising"}
     new_same = {**new, "momentum": "rising"}
     assert diff_front_matter(same, new_same) == ""
+
+
+# ---------------------------------------------------------------------------
+# Section vocabulary — the new fact-lifecycle sections (D7)
+# ---------------------------------------------------------------------------
+
+
+def _new_shape_output(name: str = "aria") -> str:
+    """An LLM reply that uses every section the fact lifecycle defines."""
+    return (
+        "DESCRIPTION: A project.\n"
+        "TAGLINE: in flight.\n"
+        "\n"
+        f"# {name}\n"
+        "\n"
+        "## Current state\n"
+        "Going well.\n"
+        "\n"
+        "## Recent activity\n"
+        "- 2026-07-28 a1b2c3d4 — moved the deploy target\n"
+        "\n"
+        "## Invariants\n"
+        "- written in Python 3.12 (since 2026-01-04)\n"
+        "- one SQLite file per host (since 2026-01-04)\n"
+        "\n"
+        "## Current state - verify live\n"
+        "- runs on host workbox — verify: `hostname` (as of 2026-07-28)\n"
+        "\n"
+        "## Open threads\n"
+        "- wire the settle tracker to opencode (raised 2026-07-28)\n"
+        "\n"
+        "## Decisions\n"
+        "- **key on session.directory** — project_id collapses (locked in 2026-07-20)\n"
+        "\n"
+        "## Resolved\n"
+        "- **pick an ingest path** — status: resolved — hybrid CLI + read-only"
+        " SQLite (2026-07-26)\n"
+        '- **deploy from proxmox** — status: superseded — superseded_by: "Azure'
+        ' Container Apps" (2026-07-28)\n'
+        "\n"
+        "## Stale\n"
+        "- audit the event table (raised 2026-05-01)\n"
+        "\n"
+        "## Contradictions\n"
+        "- 2026-07-28  rag deploy target\n"
+        '    was:  "deploy from proxmox"\n'
+        '    now:  "Azure Container Apps"\n'
+        "    src:  sessions/2026-07-28-a1b2c3d4\n"
+        "\n"
+        "## Preferences\n"
+        "- short kebab-case branch names — matches the working agreement\n"
+        "\n"
+        "## Risks\n"
+        "- the private opencode schema can change — impact: ingestion breaks"
+        " (flagged 2026-07-28)\n"
+    )
+
+
+def test_canonical_section_name_maps_every_canonical_heading_to_itself():
+    for section in CANONICAL_SECTIONS:
+        assert canonical_section_name(section) == section
+
+
+def test_canonical_section_name_maps_new_section_aliases():
+    assert canonical_section_name("Current state (verify live)") == (
+        "Current state - verify live"
+    )
+    assert canonical_section_name("Volatile") == "Current state - verify live"
+    assert canonical_section_name("Resolved threads") == "Resolved"
+    assert canonical_section_name("Stale threads") == "Stale"
+    assert canonical_section_name("CONTRADICTIONS") == "Contradictions"
+
+
+def test_canonical_section_name_unknown_heading_returns_none():
+    assert canonical_section_name("Appendix B") is None
+    assert canonical_section_name("") is None
+
+
+def test_parse_keeps_every_new_section_in_document_order():
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    order = [
+        doc.body.index(f"## {heading}")
+        for heading in (
+            "Invariants",
+            "Current state - verify live",
+            "Open threads",
+            "Decisions",
+            "Resolved",
+            "Stale",
+            "Contradictions",
+        )
+    ]
+    assert order == sorted(order)
+
+
+def test_render_body_keeps_contradiction_evidence_lines_verbatim():
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    out = doc.render_body(front_matter={"description": "A project."})
+    assert "- 2026-07-28  rag deploy target" in out
+    assert '    was:  "deploy from proxmox"' in out
+    assert '    now:  "Azure Container Apps"' in out
+    assert "    src:  sessions/2026-07-28-a1b2c3d4" in out
+
+
+def test_render_body_keeps_superseded_by_clause_verbatim():
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    out = doc.render_body(front_matter={"description": "A project."})
+    assert "status: resolved" in out
+    assert 'status: superseded — superseded_by: "Azure Container Apps"' in out
+
+
+def test_canonical_bullet_counts_for_new_sections():
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    counts = doc.canonical_bullet_counts()
+    assert counts["invariants"] == 2
+    assert counts["volatile"] == 1
+    assert counts["resolved"] == 2
+    assert counts["stale"] == 1
+    assert counts["contradictions"] == 1
+
+
+def test_canonical_bullet_counts_ignore_prose_sections():
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    counts = doc.canonical_bullet_counts()
+    assert "current_state" not in counts
+    assert "recent_activity" not in counts
+
+
+def test_canonical_bullet_counts_sum_aliases_of_one_section():
+    body = (
+        "## Decisions\n- a\n"
+        "## Long-term decisions\n- b\n- c\n"
+    )
+    counts = ProjectDoc(name="p", body=body).canonical_bullet_counts()
+    assert counts["decisions"] == 3
+
+
+def test_derive_front_matter_counts_new_sections(tmp_path: Path):
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    fm = doc.derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["invariants"] == 2
+    assert fm["volatile"] == 1
+    assert fm["resolved"] == 2
+    assert fm["stale"] == 1
+    assert fm["contradictions"] == 1
+
+
+def test_derive_front_matter_keeps_existing_count_behaviour(tmp_path: Path):
+    doc = ProjectDoc.parse(_new_shape_output(), name="aria")
+    fm = doc.derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["decisions"] == 1
+    assert fm["open_threads"] == 1
+    assert fm["preferences"] == 1
+    assert fm["risks"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility — a project.md written before the new sections
+# ---------------------------------------------------------------------------
+
+
+def _old_shape_output(name: str = "aria") -> str:
+    """A project.md in the shape sagent wrote before the fact lifecycle."""
+    return (
+        "DESCRIPTION: A project.\n"
+        "TAGLINE: in flight.\n"
+        "\n"
+        f"# {name}\n"
+        "\n"
+        "## Current state\n"
+        "Going well.\n"
+        "\n"
+        "## Long-term decisions\n"
+        "- decision A\n"
+        "- decision B\n"
+        "\n"
+        "## Open threads\n"
+        "- thread 1 (raised 2026-07-28)\n"
+        "\n"
+        "## User preferences\n"
+        "- prefers uv\n"
+        "\n"
+        "## Risks & known issues\n"
+        "- risk X\n"
+    )
+
+
+def test_old_project_md_parses_without_the_new_sections():
+    doc = ProjectDoc.parse(_old_shape_output(), name="aria")
+    assert doc.description == "A project."
+    assert doc.has_h1 is True
+    assert "## Long-term decisions" in doc.body
+    assert "- decision A" in doc.body
+
+
+def test_old_project_md_render_does_not_invent_empty_sections():
+    doc = ProjectDoc.parse(_old_shape_output(), name="aria")
+    out = doc.render_body(front_matter={"description": "A project."})
+    for heading in (
+        "## Invariants",
+        "## Current state - verify live",
+        "## Resolved",
+        "## Stale",
+        "## Contradictions",
+    ):
+        assert heading not in out
+
+
+def test_old_project_md_new_counts_read_zero(tmp_path: Path):
+    doc = ProjectDoc.parse(_old_shape_output(), name="aria")
+    fm = doc.derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["invariants"] == 0
+    assert fm["volatile"] == 0
+    assert fm["resolved"] == 0
+    assert fm["stale"] == 0
+    assert fm["contradictions"] == 0
+
+
+def test_old_project_md_keeps_legacy_heading_counts(tmp_path: Path):
+    doc = ProjectDoc.parse(_old_shape_output(), name="aria")
+    fm = doc.derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["decisions"] == 2
+    assert fm["open_threads"] == 1
+    assert fm["preferences"] == 1
+    assert fm["risks"] == 1
+
+
+def test_old_project_md_stale_decay_is_a_noop_without_aged_bullets():
+    doc = ProjectDoc.parse(_old_shape_output(), name="aria")
+    before = doc.body
+    moved = doc.apply_stale_decay(today=dt.date(2026, 7, 30))
+    assert moved == 0
+    assert doc.body == before
+
+
+# ---------------------------------------------------------------------------
+# harnesses — additive front-matter list (D5)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_harnesses_unions_and_sorts():
+    assert merge_harnesses(["opencode"], ["claude-code"]) == [
+        "claude-code",
+        "opencode",
+    ]
+
+
+def test_merge_harnesses_deduplicates():
+    assert merge_harnesses(
+        ["claude-code", "claude-code"], ["claude-code"]
+    ) == ["claude-code"]
+
+
+def test_merge_harnesses_accepts_a_bare_string():
+    assert merge_harnesses("opencode", None) == ["opencode"]
+
+
+def test_merge_harnesses_ignores_none_and_blank_entries():
+    assert merge_harnesses(None, ["", "  ", "opencode"]) == ["opencode"]
+
+
+def test_merge_harnesses_defaults_to_claude_code_when_empty():
+    assert merge_harnesses(None, []) == [DEFAULT_HARNESS]
+
+
+def test_derive_front_matter_harnesses_default_when_unknown(tmp_path: Path):
+    fm = _doc().derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["harnesses"] == [DEFAULT_HARNESS]
+
+
+def test_derive_front_matter_harnesses_are_additive(tmp_path: Path):
+    """A Claude Code roll-up must not drop an opencode harness already seen."""
+    fm = _doc().derive_front_matter(
+        sessions_dir=tmp_path / "sessions",
+        harnesses=["claude-code"],
+        prior_harnesses=["opencode"],
+    )
+    assert fm["harnesses"] == ["claude-code", "opencode"]
+
+
+def test_derive_front_matter_harnesses_accept_prior_scalar(tmp_path: Path):
+    fm = _doc().derive_front_matter(
+        sessions_dir=tmp_path / "sessions",
+        harnesses=["opencode"],
+        prior_harnesses="claude-code",
+    )
+    assert fm["harnesses"] == ["claude-code", "opencode"]
+
+
+def test_derive_front_matter_keeps_scalar_source_field(tmp_path: Path):
+    """Readers that predate the list still find `source`."""
+    fm = _doc().derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["source"] == "claude-code"
+
+
+# ---------------------------------------------------------------------------
+# Stale decay — deterministic, no LLM (D8)
+# ---------------------------------------------------------------------------
+
+
+TODAY = dt.date(2026, 7, 30)
+
+
+def _threads_body(*bullets: str) -> str:
+    return "## Open threads\n" + "\n".join(bullets) + "\n"
+
+
+def test_stale_after_days_is_thirty():
+    assert STALE_AFTER_DAYS == 30
+
+
+def test_stale_decay_moves_a_forty_day_old_thread():
+    body = _threads_body("- old thread (raised 2026-06-20)")
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    assert "## Stale" in out
+    assert out.index("## Stale") < out.index("- old thread (raised 2026-06-20)")
+
+
+def test_stale_decay_keeps_a_five_day_old_thread():
+    body = _threads_body("- fresh thread (raised 2026-07-25)")
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 0
+    assert out == body
+    assert "## Stale" not in out
+
+
+def test_stale_decay_keeps_an_undated_bullet():
+    """Guessing the age of an undated bullet is worse than leaving it open."""
+    body = _threads_body("- no date on this one")
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 0
+    assert out == body
+
+
+def test_stale_decay_leaves_the_boundary_day_open():
+    body = _threads_body("- exactly at the edge (raised 2026-06-30)")
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 0
+    assert out == body
+
+
+def test_stale_decay_moves_one_day_past_the_boundary():
+    body = _threads_body("- one day over (raised 2026-06-29)")
+    _, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+
+
+def test_stale_decay_honours_an_injected_threshold():
+    body = _threads_body("- ten days old (raised 2026-07-20)")
+    _, moved = decay_stale_threads(body, today=TODAY, stale_after_days=5)
+    assert moved == 1
+
+
+def test_stale_decay_splits_mixed_bullets():
+    body = _threads_body(
+        "- old thread (raised 2026-06-20)",
+        "- fresh thread (raised 2026-07-25)",
+        "- undated thread",
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    open_part = out[out.index("## Open threads") : out.index("## Stale")]
+    stale_part = out[out.index("## Stale") :]
+    assert "- fresh thread" in open_part
+    assert "- undated thread" in open_part
+    assert "- old thread" not in open_part
+    assert "- old thread" in stale_part
+
+
+def test_stale_decay_carries_the_bullet_evidence_lines_along():
+    body = _threads_body(
+        "- old thread (raised 2026-06-20)",
+        "    detail: blocked on the schema",
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    stale_part = out[out.index("## Stale") :]
+    assert "    detail: blocked on the schema" in stale_part
+
+
+def test_stale_decay_appends_to_an_existing_stale_section():
+    body = (
+        "## Open threads\n"
+        "- old thread (raised 2026-06-20)\n"
+        "\n"
+        "## Stale\n"
+        "- already stale (raised 2026-01-01)\n"
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    assert out.count("## Stale") == 1
+    stale_part = out[out.index("## Stale") :]
+    assert "- already stale (raised 2026-01-01)" in stale_part
+    assert "- old thread (raised 2026-06-20)" in stale_part
+
+
+def test_stale_decay_creates_stale_at_its_canonical_slot():
+    body = (
+        "## Open threads\n"
+        "- old thread (raised 2026-06-20)\n"
+        "\n"
+        "## Decisions\n"
+        "- **a decision** (locked in 2026-01-01)\n"
+        "\n"
+        "## Contradictions\n"
+        "- 2026-07-28  a label\n"
+        "\n"
+        "## Risks\n"
+        "- a risk (flagged 2026-07-01)\n"
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    assert out.index("## Decisions") < out.index("## Stale")
+    assert out.index("## Stale") < out.index("## Contradictions")
+
+
+def test_stale_decay_only_touches_open_threads():
+    body = (
+        "## Decisions\n"
+        "- **an old decision** (locked in 2026-01-01)\n"
+        "\n"
+        "## Open threads\n"
+        "- old thread (raised 2026-06-20)\n"
+        "\n"
+        "## Risks\n"
+        "- an old risk (flagged 2026-01-01)\n"
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    decisions_part = out[out.index("## Decisions") : out.index("## Open threads")]
+    assert "- **an old decision** (locked in 2026-01-01)" in decisions_part
+    assert "- an old risk (flagged 2026-01-01)" in out[out.index("## Risks") :]
+
+
+def test_stale_decay_without_open_threads_section_is_a_noop():
+    body = "## Decisions\n- **a decision** (locked in 2026-01-01)\n"
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 0
+    assert out == body
+
+
+def test_stale_decay_is_idempotent():
+    body = _threads_body(
+        "- old thread (raised 2026-06-20)",
+        "- fresh thread (raised 2026-07-25)",
+    )
+    once, moved_once = decay_stale_threads(body, today=TODAY)
+    twice, moved_twice = decay_stale_threads(once, today=TODAY)
+    assert moved_once == 1
+    assert moved_twice == 0
+    assert twice == once
+
+
+def test_stale_decay_keeps_the_preamble_above_the_first_section():
+    body = (
+        "Some hand-written preamble.\n"
+        "\n"
+        "## Open threads\n"
+        "- old thread (raised 2026-06-20)\n"
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    assert out.startswith("Some hand-written preamble.")
+
+
+def test_apply_stale_decay_updates_the_doc_body_and_counts(tmp_path: Path):
+    doc = ProjectDoc(
+        name="aria",
+        body=_threads_body(
+            "- old thread (raised 2026-06-20)",
+            "- fresh thread (raised 2026-07-25)",
+        ),
+    )
+    assert doc.apply_stale_decay(today=TODAY) == 1
+    fm = doc.derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["open_threads"] == 1
+    assert fm["stale"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Roll-up output guard (D13)
+# ---------------------------------------------------------------------------
+
+# The exact reply that overwrote workbox/hms-atlas/project.md and zeroed every
+# count. It must never be accepted again.
+CONVERSATIONAL_REPLY = (
+    "The session digest you've provided is incomplete - it shows the session "
+    "just started (5 events, 1 tool call) and the Explore agent results "
+    "haven't arrived yet.\n"
+    "\n"
+    "I can either wait for the completed session digest, or build the "
+    "project.md from the little that is here.\n"
+    "\n"
+    "Which would you prefer?"
+)
+
+
+def test_guard_rejects_the_conversational_reply():
+    assert is_valid_rollup_output(CONVERSATIONAL_REPLY) is False
+
+
+def test_guard_accepts_a_well_formed_rollup_output():
+    assert is_valid_rollup_output(_new_shape_output()) is True
+
+
+def test_guard_accepts_an_old_shape_rollup_output():
+    assert is_valid_rollup_output(_old_shape_output()) is True
+
+
+def test_guard_accepts_a_document_wrapped_in_a_code_fence():
+    fenced = "```markdown\n" + _old_shape_output() + "```\n"
+    assert is_valid_rollup_output(fenced) is True
+
+
+def test_guard_rejects_empty_output():
+    assert is_valid_rollup_output("") is False
+    assert is_valid_rollup_output("   \n\n") is False
+
+
+def test_guard_rejects_prose_that_merely_mentions_a_section_name():
+    text = (
+        "I would normally write an Open threads section here, but the "
+        "digest is too thin. Which would you prefer?"
+    )
+    assert is_valid_rollup_output(text) is False
+
+
+def test_guard_rejects_a_document_with_only_unrecognised_headings():
+    text = "# aria\n\n## Appendix B\n- something\n"
+    assert is_valid_rollup_output(text) is False
+
+
+def test_guard_accepts_output_carrying_a_single_new_section():
+    text = "# aria\n\n## Contradictions\n- 2026-07-28  a label\n"
+    assert is_valid_rollup_output(text) is True
+
+
+def test_stale_decay_leaves_an_emptied_open_threads_heading_in_place():
+    """Nothing is deleted, so the heading survives an empty section."""
+    body = (
+        "## Open threads\n"
+        "- only thread (raised 2026-06-20)\n"
+        "\n"
+        "## Decisions\n"
+        "- **a decision** (locked in 2026-01-01)\n"
+    )
+    out, moved = decay_stale_threads(body, today=TODAY)
+    assert moved == 1
+    assert "## Open threads" in out
+    counts = ProjectDoc(name="p", body=out).canonical_bullet_counts()
+    assert counts["open_threads"] == 0
+    assert counts["stale"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The `source` scalar must agree with the `harnesses` list
+# ---------------------------------------------------------------------------
+
+
+def test_source_scalar_follows_a_single_harness(tmp_path: Path):
+    fm = _doc().derive_front_matter(
+        sessions_dir=tmp_path / "sessions", harnesses=["opencode"]
+    )
+    assert fm["harnesses"] == ["opencode"]
+    # The scalar predates the list; a project whose sessions are all opencode
+    # used to report `source: claude-code` right beside `harnesses: [opencode]`.
+    assert fm["source"] == "opencode"
+
+
+def test_source_scalar_is_mixed_when_two_harnesses_wrote(tmp_path: Path):
+    fm = _doc().derive_front_matter(
+        sessions_dir=tmp_path / "sessions",
+        harnesses=["claude-code"],
+        prior_harnesses=["opencode"],
+    )
+    assert fm["harnesses"] == ["claude-code", "opencode"]
+    assert fm["source"] == "mixed"
+
+
+def test_source_scalar_defaults_to_claude_code(tmp_path: Path):
+    fm = _doc().derive_front_matter(sessions_dir=tmp_path / "sessions")
+    assert fm["harnesses"] == ["claude-code"]
+    assert fm["source"] == "claude-code"
