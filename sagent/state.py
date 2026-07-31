@@ -20,6 +20,14 @@ Two interfaces sit on top of the same underlying JSON file:
 
 `NullLedger` is a no-op adapter with the same surface, so callers never
 branch on `ledger is None`.
+
+A session key is opaque. Claude Code sessions are files, so their key is
+the JSONL path. Opencode keeps every session in one SQLite database, so
+there is no per-session file to key on; those sessions use the URI form
+`opencode://<session_id>` instead, with `SUM(LENGTH(part.data))` standing
+in for `st_size`. That value is monotonic like a file size, so the skip
+check, the settle tracker and the `--min-bytes` / `--min-delta` byte
+thresholds all keep working unchanged.
 """
 
 from __future__ import annotations
@@ -31,7 +39,32 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-CURRENT_VERSION = 1
+# v2 added URI session keys (see module docstring). No record field
+# changed, so a v1 file loads as-is and is rewritten as v2 on next save.
+CURRENT_VERSION = 2
+
+URI_MARKER = "://"
+
+
+def is_uri_key(session_key: Path | str) -> bool:
+    """True if `session_key` names a session that has no file on disk.
+
+    URI keys (`opencode://<id>`) must never go through `Path`: it
+    collapses the double slash, so `Path("opencode://x")` stringifies
+    back as `opencode:/x` and no longer matches the stored key.
+    """
+    return URI_MARKER in str(session_key)
+
+
+def normalize_key(session_key: Path | str) -> Path | str:
+    """Return the canonical in-memory form of a session key.
+
+    A URI key stays a `str`; anything else becomes a `Path`, so callers
+    that expect a path (digest output naming, prune) keep getting one.
+    """
+    if is_uri_key(session_key):
+        return str(session_key)
+    return Path(session_key)
 
 
 def default_state_path() -> Path:
@@ -67,12 +100,19 @@ class DigestClaim:
     incremental vs. full and access `digest_count`. Call `commit()` after
     a successful or terminal-drop digest; skip the call to leave state
     untouched (e.g. on rate-limit or crash).
+
+    `session_path` is a `Path` for a file-backed session and a `str` for
+    a URI key; use `session_key` when only the ledger key is wanted.
     """
 
-    session_path: Path
+    session_path: Path | str
     size: int
     prior: SessionRecord | None
     _ledger: "DigestLedger"
+
+    @property
+    def session_key(self) -> str:
+        return str(self.session_path)
 
     def commit(self, *, event_index: int) -> None:
         self._ledger.mark_digested(
@@ -128,6 +168,10 @@ class DigestLedger:
     ) -> DigestClaim | None:
         """Reserve a digest of `session_path` at `size`.
 
+        `session_path` is any session key: a JSONL path, or a URI such as
+        `opencode://<id>` for a session that lives in a database. `size`
+        is whatever monotonic byte count that source reports.
+
         Returns None if the session is already digested at >= this size
         (or the size delta is below `min_delta`). `force=True` always
         returns a claim, regardless of prior state.
@@ -137,7 +181,7 @@ class DigestLedger:
         ):
             return None
         return DigestClaim(
-            session_path=Path(session_path),
+            session_path=normalize_key(session_path),
             size=size,
             prior=self.get(session_path),
             _ledger=self,
@@ -157,6 +201,12 @@ class DigestLedger:
     # -----------------------------------------------------------------
 
     def load(self) -> None:
+        """Read the state file, whatever version wrote it.
+
+        v1 and v2 share the same record fields; v2 only widened what a
+        session key may look like. So a v1 file loads with no migration
+        and no loss, and `_loaded_version` records what was read.
+        """
         if not self.path.exists():
             return
         try:
@@ -215,6 +265,7 @@ class DigestLedger:
     # -----------------------------------------------------------------
 
     def get(self, session_path: Path | str) -> SessionRecord | None:
+        """Look up a record by session key (a path or a `<scheme>://` URI)."""
         return self.sessions.get(str(session_path))
 
     def mark_digested(
@@ -224,6 +275,10 @@ class DigestLedger:
         size: int,
         event_index: int,
     ) -> SessionRecord:
+        """Record a finished digest under the session key `session_path`.
+
+        The key is stored verbatim, so a URI key round-trips intact.
+        """
         key = str(session_path)
         rec = self.sessions.setdefault(key, SessionRecord())
         rec.last_digested_size = size
@@ -241,6 +296,10 @@ class DigestLedger:
     ) -> bool:
         """True if the session is already digested at >= this size, or if the
         delta since last digest is below min_delta.
+
+        `session_path` is a session key of either form; `size` only has to
+        grow with the session, so a database byte total works as well as
+        `st_size`.
         """
         rec = self.sessions.get(str(session_path))
         if rec is None:
@@ -252,9 +311,18 @@ class DigestLedger:
         return False
 
     def prune_missing(self, valid_paths: set[Path]) -> int:
-        """Drop records for paths that no longer exist on disk. Returns count."""
+        """Drop records for paths that no longer exist on disk. Returns count.
+
+        URI keys are exempt. `valid_paths` comes from a filesystem scan of
+        the Claude Code session directories, which can never contain a
+        session that lives in a database, so pruning against it would
+        delete every opencode record on the first pass. Only the source
+        that owns a URI scheme may retire its own keys.
+        """
         valid_strs = {str(p) for p in valid_paths}
-        gone = [k for k in self.sessions if k not in valid_strs]
+        gone = [
+            k for k in self.sessions if k not in valid_strs and not is_uri_key(k)
+        ]
         for k in gone:
             del self.sessions[k]
         return len(gone)

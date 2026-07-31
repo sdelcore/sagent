@@ -5,27 +5,46 @@ import os
 import socket
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
+from . import opencode
+from .opencode import OpencodeError
 from .parser import load_session
 from .pipeline import (
+    CLAUDE_HARNESS,
     DigestConfig,
     DigestOutcome,
     clean_project_name,
+    digest_opencode_session,
     digest_session,
 )
 from .rate import RateLimiter, SagentRateLimitError
 from .rebrand import detect_rebrands
-from .rollup import is_scratchpad, roll_up_project, update_recent
+from .rollup import (
+    RollupRejected,
+    is_scratchpad,
+    roll_up_project,
+    session_harness,
+    update_index,
+    update_recent,
+)
 from .state import DigestLedger, NullLedger, default_state_path
 from .watcher import (
     CLAUDE_PROJECTS,
+    DEFAULT_DB_POLL_SECONDS,
     DEFAULT_QUIET_SECONDS,
+    OpencodeTarget,
     latest_session,
     project_dir_for_cwd,
     watch_all,
+    watch_opencode,
     watch_project,
 )
+
+OPENCODE_HARNESS = opencode.HARNESS
+ALL_HARNESSES = "all"
+HARNESS_CHOICES = (CLAUDE_HARNESS, OPENCODE_HARNESS, ALL_HARNESSES)
 
 
 def default_out_dir() -> Path:
@@ -76,6 +95,36 @@ def _make_ledger(args: argparse.Namespace) -> DigestLedger:
     return DigestLedger(Path(args.state) if args.state else None)
 
 
+def _harness(args: argparse.Namespace) -> str:
+    """The chosen harness, defaulting to both for commands without the flag."""
+    return getattr(args, "harness", ALL_HARNESSES)
+
+
+def _wants(args: argparse.Namespace, harness: str) -> bool:
+    chosen = _harness(args)
+    return chosen in (ALL_HARNESSES, harness)
+
+
+def _opencode_db_override(args: argparse.Namespace) -> Path | None:
+    """The explicit --opencode-db, or None to let discovery run.
+
+    The watch loops re-discover the database while it is missing, so an
+    absent override is worth more to them than a path resolved once at
+    startup: opencode can be installed without restarting the service.
+    """
+    value = getattr(args, "opencode_db", None)
+    if not value:
+        return None
+    if value == ":memory:" or value.startswith("file:"):
+        return Path(value)
+    return Path(value).expanduser()
+
+
+def _opencode_db(args: argparse.Namespace) -> Path | None:
+    """The database a one-shot command should read, or None when absent."""
+    return _opencode_db_override(args) or opencode.find_database()
+
+
 def _make_rate_limiter(args: argparse.Namespace) -> RateLimiter | None:
     n = getattr(args, "max_per_hour", 0) or 0
     return RateLimiter(max_per_hour=n) if n > 0 else None
@@ -106,14 +155,68 @@ def _print_ledger_path(ledger: DigestLedger) -> None:
         print(f"[sagent] state: {ledger.path}")
 
 
+def _opencode_target_id(args: argparse.Namespace) -> str | None:
+    """The opencode session id in `digest`'s target, or None for a file.
+
+    `--harness opencode` reads the target verbatim as a session id. Under
+    the default `all` sagent never guesses: the target is an opencode id
+    only when no such path exists and the database really holds that id.
+    """
+    harness = _harness(args)
+    if harness == CLAUDE_HARNESS:
+        return None
+    target = args.target
+    if harness == OPENCODE_HARNESS:
+        if not target:
+            sys.exit("digest --harness opencode needs an opencode session id")
+        return target
+    if not target or Path(target).expanduser().exists():
+        return None
+    db = _opencode_db(args)
+    if db is None:
+        return None
+    try:
+        rows = opencode.list_sessions(db)
+    except Exception:
+        return None
+    return target if any(row.session_id == target for row in rows) else None
+
+
 def cmd_digest(args: argparse.Namespace) -> int:
-    session_path = _resolve_input(args.target)
+    session_id = _opencode_target_id(args)
     out_root = Path(args.out) if args.out else default_out_dir()
     ledger = _make_ledger(args)
     rate_limiter = _make_rate_limiter(args)
     config = _config_from(args, out_root=out_root)
+
+    if session_id is not None:
+        db = _opencode_db(args)
+        if db is None:
+            sys.exit(
+                "no opencode database found "
+                "(set --opencode-db or $OPENCODE_DB)"
+            )
+        try:
+            outcome = digest_opencode_session(
+                session_id,
+                config,
+                db_path=db,
+                ledger=ledger,
+                rate_limiter=rate_limiter,
+            )
+        except SagentRateLimitError as exc:
+            print(f"[sagent] rate limit hit: {exc}")
+            return 2
+        except OpencodeError as exc:
+            print(f"[sagent] opencode: {exc}")
+            return 2
+        if outcome.status == "dropped":
+            print(f"[sagent] {session_id} dropped: {outcome.reason}")
+        return _digest_exit_code(outcome)
+
+    session_path = _resolve_input(args.target)
     try:
-        digest_session(
+        outcome = digest_session(
             session_path,
             config,
             ledger=ledger,
@@ -122,7 +225,50 @@ def cmd_digest(args: argparse.Namespace) -> int:
     except SagentRateLimitError as exc:
         print(f"[sagent] rate limit hit: {exc}")
         return 2
+    return _digest_exit_code(outcome)
+
+
+def _digest_exit_code(outcome: DigestOutcome) -> int:
+    """0, or 1 when the roll-up refused the model's answer.
+
+    A refusal keeps the prior project.md and leaves the session unclaimed
+    for the next pass, so nothing is lost — but the exit code says so, the
+    same way `sagent rollup` does.
+    """
+    if outcome.status == "rollup_refused":
+        return 1
     return 0
+
+
+def _opencode_callback(
+    config: DigestConfig,
+    *,
+    ledger: DigestLedger,
+    rate_limiter: RateLimiter | None,
+) -> Callable[[OpencodeTarget], bool]:
+    """Adapt a settled OpencodeTarget onto the opencode digest.
+
+    The target carries everything the database sweep already read, so the
+    digest re-queries nothing.
+
+    Returns False when the roll-up was refused, so the watch loop leaves the
+    session unfired and tries again. Reporting `True` there would strand the
+    session: it has settled, so its size never changes again.
+    """
+
+    def on_opencode(target: OpencodeTarget) -> bool:
+        outcome = digest_opencode_session(
+            target.session_id,
+            config,
+            db_path=target.db_path,
+            directory=target.row.directory,
+            size=target.size,
+            ledger=ledger,
+            rate_limiter=rate_limiter,
+        )
+        return outcome.status != "rollup_refused"
+
+    return on_opencode
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -131,8 +277,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
     rate_limiter = _make_rate_limiter(args)
     config = _config_from(args, out_root=out_root)
 
-    def on_change(path: Path) -> None:
-        digest_session(path, config, ledger=ledger, rate_limiter=rate_limiter)
+    if _harness(args) == OPENCODE_HARNESS:
+        if args.target:
+            sys.exit(
+                "watch --harness opencode takes no target: opencode keeps "
+                "every session in one database, so the whole database is watched"
+            )
+        watch_opencode(
+            _opencode_callback(config, ledger=ledger, rate_limiter=rate_limiter),
+            db_path=_opencode_db_override(args),
+            quiet_seconds=args.idle_seconds,
+            ledger=ledger,
+        )
+        return 0
+
+    def on_change(path: Path) -> bool:
+        outcome = digest_session(
+            path, config, ledger=ledger, rate_limiter=rate_limiter
+        )
+        return outcome.status != "rollup_refused"
 
     if args.target:
         p = Path(args.target).expanduser()
@@ -159,8 +322,30 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
     if rate_limiter is not None:
         print(f"[sagent] rate limit: {args.max_per_hour}/hour")
 
-    def on_change(path: Path) -> None:
-        digest_session(path, config, ledger=ledger, rate_limiter=rate_limiter)
+    def on_change(path: Path) -> bool:
+        outcome = digest_session(
+            path, config, ledger=ledger, rate_limiter=rate_limiter
+        )
+        return outcome.status != "rollup_refused"
+
+    on_opencode = (
+        _opencode_callback(config, ledger=ledger, rate_limiter=rate_limiter)
+        if _wants(args, OPENCODE_HARNESS)
+        else None
+    )
+
+    if not _wants(args, CLAUDE_HARNESS):
+        watch_opencode(
+            on_opencode,
+            db_path=_opencode_db_override(args),
+            interval=args.db_poll_seconds,
+            quiet_seconds=args.idle_seconds,
+            min_bytes=args.min_bytes,
+            min_delta=args.min_delta,
+            ledger=ledger,
+            rate_limit_cooldown=args.rate_limit_cooldown,
+        )
+        return 0
 
     watch_all(
         on_change,
@@ -169,26 +354,29 @@ def cmd_watch_all(args: argparse.Namespace) -> int:
         quiet_seconds=args.idle_seconds,
         ledger=ledger,
         rate_limit_cooldown=args.rate_limit_cooldown,
+        on_opencode=on_opencode,
+        db_path=_opencode_db_override(args),
+        db_poll_seconds=args.db_poll_seconds,
     )
     return 0
 
 
-def cmd_digest_all(args: argparse.Namespace) -> int:
-    out_root = Path(args.out) if args.out else default_out_dir()
-    ledger = _make_ledger(args)
-    rate_limiter = _make_rate_limiter(args)
-    config = _config_from(args, out_root=out_root)
-    print(f"[sagent] output root: {out_root}")
-    _print_ledger_path(ledger)
-
-    counts: Counter[str] = Counter()
+def _digest_all_claude(
+    args: argparse.Namespace,
+    config: DigestConfig,
+    *,
+    ledger: DigestLedger,
+    rate_limiter: RateLimiter | None,
+    counts: Counter[str],
+) -> bool:
+    """Digest every Claude Code session. True means a rate limit stopped it."""
+    if not CLAUDE_PROJECTS.exists():
+        print(f"[sagent] no claude projects dir at {CLAUDE_PROJECTS}, skipping")
+        return False
     # Real projects first, scratchpads last
     projs = [p for p in CLAUDE_PROJECTS.iterdir() if p.is_dir()]
     projs.sort(key=lambda p: (is_scratchpad(p.name), p.name))
-    rate_limited = False
     for proj in projs:
-        if rate_limited:
-            break
         for sess in sorted(proj.glob("*.jsonl")):
             try:
                 size = sess.stat().st_size
@@ -202,15 +390,95 @@ def cmd_digest_all(args: argparse.Namespace) -> int:
                 )
             except SagentRateLimitError as exc:
                 print(f"[sagent] rate limit hit, stopping: {exc}")
-                rate_limited = True
-                break
+                return True
             counts[outcome.status] += 1
+    return False
+
+
+def _digest_all_opencode(
+    args: argparse.Namespace,
+    config: DigestConfig,
+    *,
+    ledger: DigestLedger,
+    rate_limiter: RateLimiter | None,
+    counts: Counter[str],
+) -> bool:
+    """Digest every top-level opencode session. True means a rate limit hit.
+
+    An export failure is per-session, not fatal: the claim stays uncommitted,
+    so the session is retried on the next run.
+    """
+    db = _opencode_db(args)
+    if db is None:
+        print("[sagent] no opencode database found, skipping")
+        return False
+    try:
+        rows = opencode.list_sessions(db)
+    except Exception as exc:
+        print(f"[sagent] cannot read {db}: {exc}")
+        return False
+    print(f"[sagent] opencode: {len(rows)} top-level session(s) in {db}")
+    for row in rows:
+        size = opencode.session_bytes(db, row.session_id)
+        if size < args.min_bytes:
+            continue
+        try:
+            outcome = digest_opencode_session(
+                row.session_id,
+                config,
+                db_path=db,
+                directory=row.directory,
+                size=size,
+                ledger=ledger,
+                rate_limiter=rate_limiter,
+            )
+        except SagentRateLimitError as exc:
+            print(f"[sagent] rate limit hit, stopping: {exc}")
+            return True
+        except OpencodeError as exc:
+            print(f"[sagent] opencode {row.session_id}: {exc}")
+            counts["error"] += 1
+            continue
+        counts[outcome.status] += 1
+    return False
+
+
+def cmd_digest_all(args: argparse.Namespace) -> int:
+    out_root = Path(args.out) if args.out else default_out_dir()
+    ledger = _make_ledger(args)
+    rate_limiter = _make_rate_limiter(args)
+    config = _config_from(args, out_root=out_root)
+    print(f"[sagent] output root: {out_root}")
+    _print_ledger_path(ledger)
+
+    counts: Counter[str] = Counter()
+    rate_limited = False
+    if _wants(args, CLAUDE_HARNESS):
+        rate_limited = _digest_all_claude(
+            args, config, ledger=ledger, rate_limiter=rate_limiter, counts=counts
+        )
+    if _wants(args, OPENCODE_HARNESS) and not rate_limited:
+        _digest_all_opencode(
+            args, config, ledger=ledger, rate_limiter=rate_limiter, counts=counts
+        )
 
     print(
         f"[sagent] digested {counts['digested']}; "
         f"skipped {counts['skipped']}; "
         f"dropped {counts['dropped']}"
     )
+    if counts["error"]:
+        print(f"[sagent] {counts['error']} session(s) failed to export")
+    if counts["rollup_refused"]:
+        # The session markdown for these is on disk, but the roll-up refused
+        # the model's answer, so project.md does not have them yet and the
+        # sessions are deliberately unclaimed. Say so, or the operator reads
+        # "digested 0" and assumes there was no work.
+        print(
+            f"[sagent] {counts['rollup_refused']} session(s) had their "
+            f"roll-up refused; prior project.md kept, retrying next pass"
+        )
+        return 1
     return 0
 
 
@@ -221,7 +489,9 @@ def cmd_rollup(args: argparse.Namespace) -> int:
     """
     out_root = Path(args.out) if args.out else default_out_dir()
     ledger = _make_ledger(args)
+    rate_limiter = _make_rate_limiter(args)
     project_filter = args.project
+    refused: list[str] = []
 
     if not out_root.exists():
         sys.exit(f"no output at {out_root}")
@@ -249,15 +519,24 @@ def cmd_rollup(args: argparse.Namespace) -> int:
         cwd = fm.get("cwd")
         project_source_path = Path(cwd) if cwd else None
         print(f"[sagent] {project_dir.name} → project.md (force_full={args.force_full})")
-        roll_up_project(
-            project_dir,
-            new_session_path=latest,
-            project_source_path=project_source_path,
-            model=args.model,
-            force_full=args.force_full,
-            full_rebuild_every=args.full_rebuild_every,
-            rollup_count=rollup_claim.prior_count,
-        )
+        try:
+            roll_up_project(
+                project_dir,
+                new_session_path=latest,
+                project_source_path=project_source_path,
+                model=args.model,
+                force_full=args.force_full,
+                full_rebuild_every=args.full_rebuild_every,
+                rollup_count=rollup_claim.prior_count,
+                rate_limiter=rate_limiter,
+            )
+        except RollupRejected as exc:
+            # The model answered with something that is not a digest. The
+            # prior project.md survives, the claim stays uncommitted, and the
+            # next pass retries — but the user must hear about it.
+            print(f"[sagent] REFUSED {project_dir.name}: {exc}")
+            refused.append(project_dir.name)
+            continue
         # Use the latest session's id8 as the rollup marker.
         import re
 
@@ -269,6 +548,47 @@ def cmd_rollup(args: argparse.Namespace) -> int:
         if flag:
             print(f"[sagent] rebrand detected: {key} → {flag}")
 
+    index = update_index(
+        out_root,
+        groups_model=args.model if args.groups else None,
+        # `--groups` is a request, not a hint: bypass the age gate that keeps
+        # the automatic digest flow from buying a call per session.
+        groups_max_age_hours=0.0,
+        rate_limiter=rate_limiter,
+    )
+    if index is not None:
+        print(f"[sagent] wrote {index}")
+
+    if refused:
+        print(
+            f"[sagent] {len(refused)} roll-up(s) refused, prior project.md kept: "
+            + ", ".join(sorted(refused))
+        )
+        return 1
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    """Rebuild INDEX.md, and the advisory GROUPS.md with --groups."""
+    out_root = Path(args.out) if args.out else default_out_dir()
+    if not out_root.exists():
+        sys.exit(f"no output at {out_root}")
+    rate_limiter = _make_rate_limiter(args)
+    index = update_index(
+        out_root,
+        groups_model=args.model if args.groups else None,
+        # `--groups` is a request, not a hint: bypass the age gate that keeps
+        # the automatic digest flow from buying a call per session.
+        groups_max_age_hours=0.0,
+        rate_limiter=rate_limiter,
+    )
+    if index is None:
+        print(f"[sagent] nothing to index at {out_root}")
+        return 0
+    print(f"[sagent] wrote {index}")
+    groups = out_root / "GROUPS.md"
+    if args.groups and groups.exists():
+        print(f"[sagent] wrote {groups} (advisory)")
     return 0
 
 
@@ -290,6 +610,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     removed = 0
     kept = 0
     orphaned = 0
+    foreign = 0
     for proj_dir in sorted(out_root.iterdir()):
         if not proj_dir.is_dir():
             continue
@@ -299,6 +620,13 @@ def cmd_prune(args: argparse.Namespace) -> int:
         for md in sorted(sessions_dir.glob("*.md")):
             m = re.match(r"^\d{4}-\d{2}-\d{2}-([0-9a-f]+)\.md$", md.name)
             if not m:
+                continue
+            # An opencode id8 is hex too, so the filename alone cannot say
+            # which harness wrote this digest. Only Claude Code digests have
+            # a JSONL behind them; anything else would look like an orphan
+            # and be deleted.
+            if session_harness(md.read_text(errors="ignore")) != CLAUDE_HARNESS:
+                foreign += 1
                 continue
             short = m.group(1)
             matches = list(CLAUDE_PROJECTS.glob(f"*/{short}*.jsonl"))
@@ -340,6 +668,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
             else ""
         )
     )
+    if foreign:
+        print(f"[sagent] left {foreign} non-claude-code digest(s) untouched")
     return 0
 
 
@@ -397,10 +727,14 @@ def cmd_purge_self(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_list(args: argparse.Namespace) -> int:
+def _list_claude(args: argparse.Namespace) -> None:
     root = CLAUDE_PROJECTS
+    print(f"[{CLAUDE_HARNESS}] {root}")
     if not root.exists():
-        sys.exit(f"no claude projects dir at {root}")
+        if _harness(args) == CLAUDE_HARNESS:
+            sys.exit(f"no claude projects dir at {root}")
+        print("  (not present)")
+        return
     for proj in sorted(root.iterdir()):
         if not proj.is_dir():
             continue
@@ -412,6 +746,44 @@ def cmd_list(args: argparse.Namespace) -> int:
         if args.verbose:
             for s in sessions[-3:]:
                 print(f"  {s.name}  {s.stat().st_size:>10} bytes")
+
+
+def _list_opencode(args: argparse.Namespace) -> None:
+    """List opencode sessions grouped by the cwd that keys their project.
+
+    Child sessions never appear: `list_sessions` excludes them, and sagent
+    never digests one.
+    """
+    db = _opencode_db(args)
+    print(f"[{OPENCODE_HARNESS}] {db or '(no database found)'}")
+    if db is None:
+        if _harness(args) == OPENCODE_HARNESS:
+            sys.exit("no opencode database found (set --opencode-db or $OPENCODE_DB)")
+        return
+    try:
+        rows = opencode.list_sessions(db)
+    except Exception as exc:
+        print(f"  (cannot read {db}: {exc})")
+        return
+    by_project: dict[str, list[opencode.SessionRow]] = {}
+    for row in rows:
+        by_project.setdefault(row.project_key, []).append(row)
+    for key in sorted(by_project):
+        sessions = sorted(by_project[key], key=lambda r: r.time_updated)
+        kind = "scratchpad" if is_scratchpad(key) else "project"
+        print(f"{key}  ({len(sessions)} sessions, {kind})")
+        if args.verbose:
+            for row in sessions[-3:]:
+                size = opencode.session_bytes(db, row.session_id)
+                updated = opencode.to_iso(row.time_updated) or "?"
+                print(f"  {row.ledger_key}  {size:>10} bytes  {updated}")
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    if _wants(args, CLAUDE_HARNESS):
+        _list_claude(args)
+    if _wants(args, OPENCODE_HARNESS):
+        _list_opencode(args)
     return 0
 
 
@@ -421,6 +793,37 @@ def _add_min_prompts_arg(p: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="drop sessions with fewer than this many user prompts (default: 1)",
+    )
+
+
+def _add_harness_args(
+    p: argparse.ArgumentParser,
+    *,
+    default: str = ALL_HARNESSES,
+    choices: tuple[str, ...] = HARNESS_CHOICES,
+) -> None:
+    """Add --harness and --opencode-db.
+
+    Both harnesses share one ledger, one output root and one API budget, so
+    `all` is the default wherever a command sweeps rather than targets.
+    """
+    p.add_argument(
+        "--harness",
+        choices=list(choices),
+        default=default,
+        help=f"which harness to read (default: {default})",
+    )
+    p.add_argument(
+        "--opencode-db",
+        default=None,
+        metavar="PATH",
+        help=(
+            "opencode SQLite database (default: $OPENCODE_DB, else "
+            "opencode*.db under $XDG_DATA_HOME/opencode, preferring the "
+            "default channel's opencode.db then the first name in sort "
+            "order — NOT the most recently written one, so pass this "
+            "after an install-channel switch)"
+        ),
     )
 
 
@@ -473,11 +876,14 @@ def main(argv: list[str] | None = None) -> int:
         "or ./sagent-out)"
     )
 
-    pd = sub.add_parser("digest", help="digest a single session JSONL")
+    pd = sub.add_parser("digest", help="digest a single session")
     pd.add_argument(
         "target",
         nargs="?",
-        help="path to .jsonl, project dir, or cwd; default = current cwd's latest",
+        help=(
+            "path to .jsonl, project dir, or cwd; an opencode session id also "
+            "works; default = current cwd's latest"
+        ),
     )
     pd.add_argument("--out", default=None, help=out_help)
     pd.add_argument("--model", **common_model)
@@ -488,6 +894,7 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the project-level project.md / recent.md update",
     )
     _add_min_prompts_arg(pd)
+    _add_harness_args(pd)
     _add_rate_args(pd)
     _add_state_args(pd)
     pd.set_defaults(func=cmd_digest)
@@ -509,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
         help="skip if file grew less than this many bytes since last digest",
     )
     _add_min_prompts_arg(pda)
+    _add_harness_args(pda)
     _add_rate_args(pda)
     _add_state_args(pda)
     pda.set_defaults(func=cmd_digest_all)
@@ -525,12 +933,18 @@ def main(argv: list[str] | None = None) -> int:
         help=f"idle threshold before digesting (default: {DEFAULT_QUIET_SECONDS:.0f}s)",
     )
     _add_min_prompts_arg(pw)
+    # `all` is meaningless here: a target names one Claude Code project, and
+    # opencode has no per-project file to watch.
+    _add_harness_args(
+        pw, default=CLAUDE_HARNESS, choices=(CLAUDE_HARNESS, OPENCODE_HARNESS)
+    )
     _add_rate_args(pw)
     _add_state_args(pw)
     pw.set_defaults(func=cmd_watch)
 
     pwa = sub.add_parser(
-        "watch-all", help="watch every project in ~/.claude/projects/"
+        "watch-all",
+        help="watch every Claude Code project and every opencode session",
     )
     pwa.add_argument("--out", default=None, help=out_help)
     pwa.add_argument("--model", **common_model)
@@ -562,7 +976,17 @@ def main(argv: list[str] | None = None) -> int:
             "resuming digests (default: 1800)"
         ),
     )
+    pwa.add_argument(
+        "--db-poll-seconds",
+        type=float,
+        default=DEFAULT_DB_POLL_SECONDS,
+        help=(
+            "how often to sweep the opencode database "
+            f"(default: {DEFAULT_DB_POLL_SECONDS:.0f})"
+        ),
+    )
     _add_min_prompts_arg(pwa)
+    _add_harness_args(pwa)
     _add_rate_args(pwa)
     _add_state_args(pwa)
     pwa.set_defaults(func=cmd_watch_all)
@@ -576,8 +1000,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     pru.add_argument("--out", default=None, help=out_help)
     pru.add_argument("--model", **common_model)
+    pru.add_argument(
+        "--groups",
+        action="store_true",
+        help="force a refresh of the advisory GROUPS.md now (one extra LLM call)",
+    )
+    _add_rate_args(pru)
     _add_state_args(pru)
     pru.set_defaults(func=cmd_rollup)
+
+    pix = sub.add_parser("index", help="rebuild INDEX.md across every project")
+    pix.add_argument("--out", default=None, help=out_help)
+    pix.add_argument("--model", **common_model)
+    pix.add_argument(
+        "--groups",
+        action="store_true",
+        help="force a refresh of the advisory GROUPS.md now (one LLM call)",
+    )
+    _add_rate_args(pix)
+    pix.set_defaults(func=cmd_index)
 
     ppr = sub.add_parser(
         "prune", help="delete per-session digests whose source has no real content"
@@ -610,8 +1051,9 @@ def main(argv: list[str] | None = None) -> int:
     pps.add_argument("-v", "--verbose", action="store_true")
     pps.set_defaults(func=cmd_purge_self)
 
-    pl = sub.add_parser("list", help="list Claude Code projects with sessions")
+    pl = sub.add_parser("list", help="list projects with sessions, per harness")
     pl.add_argument("-v", "--verbose", action="store_true")
+    _add_harness_args(pl)
     pl.set_defaults(func=cmd_list)
 
     args = p.parse_args(argv)

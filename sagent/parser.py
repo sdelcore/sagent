@@ -16,6 +16,27 @@ EventKind = Literal[
 
 NOISE_TYPES = {"file-history-snapshot", "permission-mode", "last-prompt", "attachment"}
 
+# Session-id prefixes that carry no identity. Opencode ids look like
+# `ses_08ed513b1ffeAv6xEe73sudEqi`; the literal `ses_` would eat half the
+# short handle and leave four varying characters, which collided six ways
+# across 28 live sessions on this host.
+ID_PREFIXES = ("ses_",)
+
+
+def short_session_id(session_id: str) -> str:
+    """The 8-character handle used in digest filenames and front matter.
+
+    A Claude Code id is a UUID, so its first hyphen-delimited group is
+    already unique. Any other harness gets its scheme prefix dropped first,
+    so the handle keeps eight characters of real entropy.
+    """
+    sid = session_id
+    for prefix in ID_PREFIXES:
+        if sid.startswith(prefix):
+            sid = sid[len(prefix) :]
+            break
+    return sid.split("-")[0][:8]
+
 
 @dataclass
 class Event:
@@ -63,7 +84,7 @@ class Session:
 
     @property
     def short_id(self) -> str:
-        return self.session_id.split("-")[0][:8]
+        return short_session_id(self.session_id)
 
     @property
     def is_sagent_self_generated(self) -> bool:

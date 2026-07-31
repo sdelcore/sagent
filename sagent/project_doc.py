@@ -13,6 +13,9 @@ Everything that touches the shape of a per-project digest lives here:
   - building the front-matter dict from doc fields plus session stats
   - bucketing momentum and days-since-last-session
   - diffing two front-matter dicts into a single changelog line
+  - the canonical set of sections, so a fact can be moved between them
+    deterministically (stale decay) and so a structurally broken LLM reply
+    can be rejected before it overwrites a good digest
 
 The rollup module owns the LLM call, file I/O, and the changelog file
 itself; this module owns the document type.
@@ -20,13 +23,117 @@ itself; this module owns the document type.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .frontmatter import cap_description
+
+
+# ---------------------------------------------------------------------------
+# Sections — the vocabulary of a project.md body
+# ---------------------------------------------------------------------------
+
+# Canonical order. A section is only ever created at its canonical slot
+# (stale decay does this); existing sections are never reordered, because a
+# user may hand-edit the file and re-shuffling their document is destructive.
+CANONICAL_SECTIONS: tuple[str, ...] = (
+    "Current state",
+    "Recent activity",
+    "Invariants",
+    "Current state - verify live",
+    "Open threads",
+    "Decisions",
+    "Resolved",
+    "Stale",
+    "Contradictions",
+    "Preferences",
+    "Risks",
+)
+
+# Heading spellings that map onto a canonical section. The LLM prompt has
+# changed wording across versions ("Long-term decisions" → "Decisions") and
+# older files on disk still carry the old headings, so recognition must be
+# generous rather than exact.
+_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "Current state": ("current state",),
+    "Recent activity": ("recent activity",),
+    "Invariants": ("invariants",),
+    "Current state - verify live": (
+        "current state - verify live",
+        "current state (verify live)",
+        "verify live",
+        "volatile",
+    ),
+    "Open threads": ("open threads", "open questions"),
+    "Decisions": ("decisions", "long-term decisions", "key decisions"),
+    "Resolved": ("resolved", "resolved threads"),
+    "Stale": ("stale", "stale threads"),
+    "Contradictions": ("contradictions",),
+    "Preferences": ("preferences", "user preferences"),
+    "Risks": (
+        "risks",
+        "risks & known issues",
+        "risks & blockers",
+        "known issues",
+    ),
+}
+
+# Canonical section → front-matter count key. Sections that carry prose
+# rather than facts (Current state, Recent activity) have no count.
+_SECTION_COUNT_KEYS: dict[str, str] = {
+    "Invariants": "invariants",
+    "Current state - verify live": "volatile",
+    "Open threads": "open_threads",
+    "Decisions": "decisions",
+    "Resolved": "resolved",
+    "Stale": "stale",
+    "Contradictions": "contradictions",
+    "Preferences": "preferences",
+    "Risks": "risks",
+}
+
+# Bullets left untouched for this long stop being "open" and become history.
+STALE_AFTER_DAYS = 30
+
+# A project.md with no harness recorded predates opencode ingestion, so it
+# can only have come from Claude Code.
+DEFAULT_HARNESS = "claude-code"
+
+_H2_RE = re.compile(r"^##\s+(.+?)\s*$")
+_BULLET_RE = re.compile(r"^-\s+")
+_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def _normalise_heading(heading: str) -> str:
+    """Fold a heading to a comparison key: lowercase, punctuation-free."""
+    text = heading.strip().lower().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_ALIAS_LOOKUP: dict[str, str] = {
+    _normalise_heading(alias): canonical
+    for canonical, aliases in _SECTION_ALIASES.items()
+    for alias in (canonical, *aliases)
+}
+
+
+def canonical_section_name(heading: str) -> str | None:
+    """Map a `## ` heading onto its canonical name, or None if unrecognised."""
+    return _ALIAS_LOOKUP.get(_normalise_heading(heading))
+
+
+def _canonical_rank(heading: str) -> int:
+    """Sort position of a heading; unrecognised sections sort to the end."""
+    canonical = canonical_section_name(heading)
+    if canonical is None:
+        return len(CANONICAL_SECTIONS)
+    return CANONICAL_SECTIONS.index(canonical)
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +231,38 @@ class ProjectDoc:
     # ------------------------------------------------------------------
 
     def section_bullet_counts(self) -> dict[str, int]:
-        """Count `- ` bullets under each `## Section` heading in `body`."""
+        """Count `- ` bullets under each `## Section` heading in `body`.
+
+        Keys are the raw headings as written in the document.
+        """
         return _count_section_bullets(self.body)
+
+    def canonical_bullet_counts(self) -> dict[str, int]:
+        """Bullet counts keyed by front-matter field, not by raw heading.
+
+        Heading spellings drift ("Long-term decisions" vs "Decisions"), so
+        counts for every alias of a canonical section are summed into one
+        key. Sections carrying prose contribute nothing.
+        """
+        totals: dict[str, int] = dict.fromkeys(_SECTION_COUNT_KEYS.values(), 0)
+        for heading, count in _count_section_bullets(self.body).items():
+            canonical = canonical_section_name(heading)
+            key = _SECTION_COUNT_KEYS.get(canonical or "")
+            if key:
+                totals[key] += count
+        return totals
+
+    def apply_stale_decay(
+        self,
+        *,
+        today: dt.date | None = None,
+        stale_after_days: int = STALE_AFTER_DAYS,
+    ) -> int:
+        """Move aged-out open threads into `## Stale`. Returns how many moved."""
+        self.body, moved = decay_stale_threads(
+            self.body, today=today, stale_after_days=stale_after_days
+        )
+        return moved
 
     def derive_front_matter(
         self,
@@ -134,14 +271,19 @@ class ProjectDoc:
         now: float | None = None,
         last_updated: str | None = None,
         remote_url: str | None = None,
+        harnesses: Iterable[str] | str | None = None,
+        prior_harnesses: Iterable[str] | str | None = None,
     ) -> dict[str, Any]:
         """Build the front-matter dict from doc fields and session stats.
 
         `sessions_dir` is the directory of per-session `.md` files; mtimes
         drive the recent-activity counts. `remote_url` is the project's git
         remote (captured by the caller) and is stored verbatim so rebrand
-        detection can cross-walk renamed repos. `now` and `last_updated` are
-        injectable for deterministic tests.
+        detection can cross-walk renamed repos. `harnesses` are the harness
+        names seen in this roll-up and `prior_harnesses` the ones already
+        recorded in the file; they are unioned, never replaced, because one
+        project.md accumulates sessions from several harnesses over time.
+        `now` and `last_updated` are injectable for deterministic tests.
         """
         if now is None:
             now = time.time()
@@ -164,13 +306,21 @@ class ProjectDoc:
             if cutoff_14d <= f.stat().st_mtime < cutoff_7d
         )
 
-        counts = self.section_bullet_counts()
+        counts = self.canonical_bullet_counts()
 
         days_since = _days_since_last_session(session_files, now=now)
 
+        merged = merge_harnesses(prior_harnesses, harnesses)
+
         return {
             "type": "project",
-            "source": "claude-code",
+            # The scalar predates the list and is kept for readers that only
+            # know `source`. It must agree with the list, so it is derived
+            # from it rather than assumed — a project whose sessions are all
+            # opencode used to report `source: claude-code` beside
+            # `harnesses: ["opencode"]`.
+            "source": merged[0] if len(merged) == 1 else "mixed",
+            "harnesses": merged,
             "project": self.name,
             "description": self.description,
             "tagline": self.tagline,
@@ -183,14 +333,15 @@ class ProjectDoc:
                 momentum_bucket(sessions_last_7d, sessions_prior_7d),
                 days_since,
             ),
-            "decisions": counts.get("Long-term decisions", 0)
-            + counts.get("Decisions", 0),
-            "open_threads": counts.get("Open threads", 0),
-            "preferences": counts.get("User preferences", 0)
-            + counts.get("Preferences", 0),
-            "risks": counts.get("Risks & known issues", 0)
-            + counts.get("Risks", 0)
-            + counts.get("Risks & blockers", 0),
+            "decisions": counts.get("decisions", 0),
+            "open_threads": counts.get("open_threads", 0),
+            "preferences": counts.get("preferences", 0),
+            "risks": counts.get("risks", 0),
+            "invariants": counts.get("invariants", 0),
+            "volatile": counts.get("volatile", 0),
+            "resolved": counts.get("resolved", 0),
+            "stale": counts.get("stale", 0),
+            "contradictions": counts.get("contradictions", 0),
         }
 
 
@@ -237,6 +388,217 @@ def build_headline_block(project_name: str, fm: dict[str, Any]) -> list[str]:
         lines.append("")
         lines.append("`" + " · ".join(stats_bits) + "`")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Harnesses — additive front-matter field
+# ---------------------------------------------------------------------------
+
+
+def merge_harnesses(*groups: Iterable[str] | str | None) -> list[str]:
+    """Union harness names into one sorted list.
+
+    Additive on purpose: a project.md that has ever seen an opencode session
+    keeps `opencode` even when the next roll-up comes from Claude Code, so
+    the field records the history of the file rather than the last writer.
+    Accepts a bare string (front matter may hold a scalar) or any iterable.
+    """
+    names: set[str] = set()
+    for group in groups:
+        if group is None:
+            continue
+        items = [group] if isinstance(group, str) else list(group)
+        for item in items:
+            name = str(item).strip()
+            if name:
+                names.add(name)
+    return sorted(names) or [DEFAULT_HARNESS]
+
+
+# ---------------------------------------------------------------------------
+# Stale decay — deterministic, no LLM
+# ---------------------------------------------------------------------------
+
+
+def decay_stale_threads(
+    body: str,
+    *,
+    today: dt.date | None = None,
+    stale_after_days: int = STALE_AFTER_DAYS,
+) -> tuple[str, int]:
+    """Move aged-out `## Open threads` bullets into `## Stale`.
+
+    A thread nobody has touched for `stale_after_days` is no longer open in
+    any useful sense, but deleting it loses evidence. Moving it is the
+    fact-level mirror of project-level momentum decay: the bullet survives,
+    it just stops competing for the reader's attention.
+
+    A bullet ages by the last `YYYY-MM-DD` it carries (the `(raised <date>)`
+    suffix the prompt asks for). A bullet with no parseable date stays put —
+    guessing an age would be worse than leaving it open. Returns the new body
+    and the number of bullets moved; the body is returned unchanged when
+    nothing moved, so a re-run never churns the file.
+    """
+    if today is None:
+        today = dt.date.today()
+
+    preamble, sections = _split_sections(body)
+    open_idx = _find_section(sections, "Open threads")
+    if open_idx is None:
+        return body, 0
+
+    lead, blocks = _split_bullet_blocks(sections[open_idx].lines)
+    kept: list[list[str]] = []
+    moved: list[list[str]] = []
+    for block in blocks:
+        raised = _trailing_date("\n".join(block))
+        if raised is not None and (today - raised).days > stale_after_days:
+            moved.append(block)
+        else:
+            kept.append(block)
+
+    if not moved:
+        return body, 0
+
+    sections[open_idx].lines = _rebuild_section_lines(lead, kept)
+
+    stale_idx = _find_section(sections, "Stale")
+    if stale_idx is None:
+        stale = _Section(heading="Stale")
+        stale_idx = _insert_at_canonical_slot(sections, stale)
+    stale_lead, stale_blocks = _split_bullet_blocks(sections[stale_idx].lines)
+    sections[stale_idx].lines = _rebuild_section_lines(
+        stale_lead, [*stale_blocks, *moved]
+    )
+
+    return _join_sections(preamble, sections), len(moved)
+
+
+# ---------------------------------------------------------------------------
+# Roll-up output guard
+# ---------------------------------------------------------------------------
+
+
+def is_valid_rollup_output(text: str) -> bool:
+    """True when an LLM roll-up reply is shaped like a project digest.
+
+    The model sometimes answers conversationally instead of emitting the
+    document ("The session digest you've provided is incomplete... Which
+    would you prefer?"). Writing that reply destroys the accumulated digest
+    and every count reads 0 afterwards. One recognised `## ` heading is
+    enough to tell a document from a chat message, and it is a test the real
+    output always passes. Pure — the caller decides what to do with False.
+    """
+    for line in _strip_code_fence(text).splitlines():
+        m = _H2_RE.match(line)
+        if m and canonical_section_name(m.group(1)) is not None:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Section surgery helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Section:
+    """One `## ` block: the heading text and every line under it."""
+
+    heading: str
+    lines: list[str] = field(default_factory=list)
+
+
+def _split_sections(body: str) -> tuple[list[str], list[_Section]]:
+    """Split a body into the pre-first-heading lines and its `## ` sections."""
+    preamble: list[str] = []
+    sections: list[_Section] = []
+    for line in body.splitlines():
+        m = _H2_RE.match(line)
+        if m:
+            sections.append(_Section(heading=m.group(1).strip()))
+        elif sections:
+            sections[-1].lines.append(line)
+        else:
+            preamble.append(line)
+    return preamble, sections
+
+
+def _join_sections(preamble: list[str], sections: list[_Section]) -> str:
+    out = list(preamble)
+    for section in sections:
+        out.append(f"## {section.heading}")
+        out.extend(section.lines)
+    return "\n".join(out).rstrip("\n")
+
+
+def _find_section(sections: list[_Section], canonical: str) -> int | None:
+    for i, section in enumerate(sections):
+        if canonical_section_name(section.heading) == canonical:
+            return i
+    return None
+
+
+def _insert_at_canonical_slot(sections: list[_Section], new: _Section) -> int:
+    """Insert `new` before the first section that outranks it; return its index."""
+    rank = _canonical_rank(new.heading)
+    index = len(sections)
+    for i, section in enumerate(sections):
+        if _canonical_rank(section.heading) > rank:
+            index = i
+            break
+    sections.insert(index, new)
+    if index > 0:
+        prior = sections[index - 1].lines
+        if prior and prior[-1].strip():
+            prior.append("")
+    return index
+
+
+def _split_bullet_blocks(
+    lines: list[str],
+) -> tuple[list[str], list[list[str]]]:
+    """Split section lines into a lead-in and one block per top-level bullet.
+
+    A block owns its continuation lines (indented detail, `was:`/`now:`/`src:`),
+    so moving a bullet moves its evidence with it.
+    """
+    lead: list[str] = []
+    blocks: list[list[str]] = []
+    for line in lines:
+        if _BULLET_RE.match(line):
+            blocks.append([line])
+        elif blocks:
+            blocks[-1].append(line)
+        else:
+            lead.append(line)
+    return lead, blocks
+
+
+def _rebuild_section_lines(
+    lead: list[str], blocks: list[list[str]]
+) -> list[str]:
+    """Reassemble a section, normalising to one trailing blank line."""
+    out = list(lead)
+    for block in blocks:
+        trimmed = list(block)
+        while trimmed and not trimmed[-1].strip():
+            trimmed.pop()
+        out.extend(trimmed)
+    while out and not out[-1].strip():
+        out.pop()
+    out.append("")
+    return out
+
+
+def _trailing_date(text: str) -> dt.date | None:
+    """Last valid `YYYY-MM-DD` in `text`, or None when there is none."""
+    for m in reversed(list(_DATE_RE.finditer(text))):
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------

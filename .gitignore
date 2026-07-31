@@ -8,3 +8,5 @@ build/
 sagent-out/
 .envrc.local
 uv.lock
+result
+result-*

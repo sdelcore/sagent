@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sagent.opencode import ledger_key
 from sagent.state import (
     CURRENT_VERSION,
     DigestLedger,
     NullLedger,
     SessionRecord,
     default_state_path,
+    is_uri_key,
+    normalize_key,
 )
 
 
@@ -237,3 +240,145 @@ def test_null_ledger_starts_empty():
     led = NullLedger()
     assert led.sessions == {}
     assert led.projects == {}
+
+
+# ---------------------------------------------------------------------------
+# URI session keys (opencode://<id>)
+# ---------------------------------------------------------------------------
+
+OPENCODE_KEY = "opencode://ses_08ed513b1ffeAv6xEe73sudEqi"
+
+
+def test_is_uri_key_distinguishes_the_two_key_forms():
+    assert is_uri_key(OPENCODE_KEY)
+    assert not is_uri_key("/home/u/.claude/projects/p/abc.jsonl")
+    assert not is_uri_key(Path("/a/b.jsonl"))
+
+
+def test_normalize_key_keeps_a_uri_a_string():
+    """`Path` collapses the double slash, so a URI key must never become one."""
+    assert normalize_key(OPENCODE_KEY) == OPENCODE_KEY
+    assert isinstance(normalize_key(OPENCODE_KEY), str)
+    assert normalize_key("/a/b.jsonl") == Path("/a/b.jsonl")
+
+
+def test_opencode_key_roundtrips_through_the_ledger(tmp_path: Path):
+    p = tmp_path / "s.json"
+    led = DigestLedger(p)
+    led.mark_digested(OPENCODE_KEY, size=4096, event_index=12)
+    led.save()
+
+    reloaded = DigestLedger(p)
+    assert list(reloaded.sessions) == [OPENCODE_KEY]
+    rec = reloaded.get(OPENCODE_KEY)
+    assert rec is not None
+    assert rec.last_digested_size == 4096
+    assert rec.last_event_index == 12
+
+
+def test_opencode_key_uses_byte_semantics_for_skip(tmp_path: Path):
+    """The part-data total behaves like st_size, so the thresholds are unchanged."""
+    led = DigestLedger(tmp_path / "s.json")
+    led.mark_digested(OPENCODE_KEY, size=4096, event_index=12)
+    assert led.should_skip(OPENCODE_KEY, size=4096)
+    assert not led.should_skip(OPENCODE_KEY, size=5000)
+    assert led.should_skip(OPENCODE_KEY, size=5000, min_delta=2000)
+    assert not led.should_skip(OPENCODE_KEY, size=7000, min_delta=2000)
+
+
+def test_claim_of_a_uri_key_stays_a_string(tmp_path: Path):
+    led = DigestLedger(tmp_path / "s.json")
+    claim = led.claim(OPENCODE_KEY, size=4096)
+    assert claim is not None
+    assert claim.session_path == OPENCODE_KEY
+    assert claim.session_key == OPENCODE_KEY
+    claim.commit(event_index=3)
+    assert led.claim(OPENCODE_KEY, size=4096) is None
+
+
+def test_claim_commit_writes_the_uri_key_verbatim(tmp_path: Path):
+    p = tmp_path / "s.json"
+    led = DigestLedger(p)
+    led.claim(OPENCODE_KEY, size=4096).commit(event_index=3)  # type: ignore[union-attr]
+    data = json.loads(p.read_text())
+    assert OPENCODE_KEY in data["sessions"]
+
+
+def test_opencode_ledger_key_is_the_key_the_ledger_stores(tmp_path: Path):
+    led = DigestLedger(tmp_path / "s.json")
+    key = ledger_key("ses_abc")
+    led.mark_digested(key, size=10, event_index=1)
+    assert led.get("opencode://ses_abc") is not None
+
+
+def test_prune_missing_keeps_uri_keys(tmp_path: Path):
+    """A filesystem scan can never list a session that lives in a database."""
+    led = DigestLedger(tmp_path / "s.json")
+    led.mark_digested("/exists.jsonl", size=1, event_index=1)
+    led.mark_digested("/gone.jsonl", size=1, event_index=1)
+    led.mark_digested(OPENCODE_KEY, size=1, event_index=1)
+    removed = led.prune_missing({Path("/exists.jsonl")})
+    assert removed == 1
+    assert OPENCODE_KEY in led.sessions
+    assert "/gone.jsonl" not in led.sessions
+
+
+def test_prune_missing_against_an_empty_scan_keeps_uri_keys(tmp_path: Path):
+    led = DigestLedger(tmp_path / "s.json")
+    led.mark_digested(OPENCODE_KEY, size=1, event_index=1)
+    assert led.prune_missing(set()) == 0
+    assert OPENCODE_KEY in led.sessions
+
+
+# ---------------------------------------------------------------------------
+# State file version
+# ---------------------------------------------------------------------------
+
+
+def test_current_version_is_two():
+    assert CURRENT_VERSION == 2
+
+
+def test_version_one_file_still_loads(tmp_path: Path):
+    """v1 and v2 share every record field, so a v1 file needs no migration."""
+    p = tmp_path / "s.json"
+    p.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sessions": {
+                    "/a.jsonl": {
+                        "last_digested_size": 900,
+                        "last_event_index": 7,
+                        "last_digested_at": "2026-07-01T00:00:00Z",
+                        "digest_count": 2,
+                    }
+                },
+                "projects": {
+                    "proj": {
+                        "last_rolled_up_session_id": "abc",
+                        "last_rolled_up_at": "2026-07-01T00:00:00Z",
+                        "rollup_count": 4,
+                    }
+                },
+            }
+        )
+    )
+    led = DigestLedger(p)
+    assert led.get("/a.jsonl") == SessionRecord(
+        last_digested_size=900,
+        last_event_index=7,
+        last_digested_at="2026-07-01T00:00:00Z",
+        digest_count=2,
+    )
+    assert led.get_project("proj").rollup_count == 4  # type: ignore[union-attr]
+    assert led.should_skip("/a.jsonl", size=900)
+
+
+def test_version_one_file_is_rewritten_as_version_two(tmp_path: Path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"version": 1, "sessions": {}}))
+    led = DigestLedger(p)
+    led.mark_digested(OPENCODE_KEY, size=1, event_index=1)
+    led.save()
+    assert json.loads(p.read_text())["version"] == 2
