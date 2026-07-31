@@ -50,15 +50,23 @@ HARNESS_CHOICES = (CLAUDE_HARNESS, OPENCODE_HARNESS, ALL_HARNESSES)
 def default_out_dir() -> Path:
     """Compute the default output root.
 
-    Precedence: $SAGENT_OUT > ~/Obsidian/sagent/<hostname> > ./sagent-out
+    Precedence: $SAGENT_OUT > ~/.sagent/<hostname>
+
+    The default is deliberately a plain dot-directory, not a vault path.
+    sagent used to sniff for ~/Obsidian and write there when it existed,
+    which made the destination depend on whether an unrelated program had
+    been installed -- the same command wrote to two different places on two
+    machines. Anyone who wants the digests in a vault says so once, via
+    $SAGENT_OUT, --out, or services.sagent.outDir.
+
+    The <hostname> segment stays because the document model is keyed
+    <host>/<project>: INDEX.md aggregates the projects under one root, so
+    two machines sharing a root would merge their fleets into one index.
     """
     env = os.environ.get("SAGENT_OUT")
     if env:
         return Path(env).expanduser()
-    obsidian = Path.home() / "Obsidian"
-    if obsidian.is_dir():
-        return obsidian / "sagent" / socket.gethostname()
-    return Path("sagent-out")
+    return Path.home() / ".sagent" / socket.gethostname()
 
 
 def _resolve_input(arg: str | None) -> Path:
@@ -871,10 +879,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     common_model = dict(default="claude-haiku-4-5")
-    out_help = (
-        "output root (default: $SAGENT_OUT or ~/Obsidian/sagent/<hostname>/ "
-        "or ./sagent-out)"
-    )
+    out_help = "output root (default: $SAGENT_OUT or ~/.sagent/<hostname>/)"
 
     pd = sub.add_parser("digest", help="digest a single session")
     pd.add_argument(
